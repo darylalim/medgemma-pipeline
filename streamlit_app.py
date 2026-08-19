@@ -657,14 +657,14 @@ def run_model(
             model,
             processor,
             formatted_prompt,  # ty: ignore[invalid-argument-type]
-            image_for_model,  # ty: ignore[invalid-argument-type]
+            image_for_model,
             max_tokens=max_new_tokens,
             temperature=0.0,
             **penalty_kwargs,
         ):
-            # stream_generate yields GenerationResult chunks; its return annotation
-            # mislabels them as str, so the .text access needs a suppression.
-            yield chunk.text  # ty: ignore[unresolved-attribute]
+            # stream_generate yields GenerationResult chunks; .text is the incremental
+            # delta, not the running text, so write_stream concatenates them.
+            yield chunk.text
 
     try:
         # write_stream renders the tokens live and returns the concatenated string.
