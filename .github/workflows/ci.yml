@@ -16,7 +16,10 @@ concurrency:
 jobs:
   check:
     runs-on: macos-15          # Apple Silicon (arm64) — matches dev + prod
-    timeout-minutes: 15        # ~11s suite; cap a hung uv sync / pytest at minutes, not 6h
+    # CI has no warm case -- uv sync rebuilds the venv every job -- so the suite
+    # runs on the order of a minute here. The cap bounds a hung uv sync / pytest at
+    # minutes, not 6h; tests/test_app_ui.py sizes APP_RUN_TIMEOUT to report inside it.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 

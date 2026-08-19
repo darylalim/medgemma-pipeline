@@ -22,6 +22,79 @@ from tests.dicom_helpers import dicom_bytes
 
 APP_PATH = str(Path(__file__).parent.parent / "streamlit_app.py")
 
+# AppTest.run() budgets ONE script run in wall-clock time, and its 3s default is far
+# too tight for the first run that renders model output in a freshly created venv.
+# Streamlit imports its dataframe stack lazily, so the first st.write_stream pulls in
+# pandas + pyarrow -- ~350 modules, measured at 16-20s off a cold page cache against
+# ~0.03s once warm. So
+#   rm -rf .venv && uv sync --locked && uv run pytest
+# (what every CI job does -- the runner builds the venv from scratch each time)
+# reproducibly fails whichever test generates first. It reproduces on the previous
+# lockfile too, so it is latent rather than newly introduced; GitHub's runners have
+# stayed under 3s so far, but that margin is nothing to rely on.
+#
+# Note the cost rides on the GENERATION path, not the base render: rendering the script
+# alone is ~3s cold and does not import pandas, which is why the warmup below has to
+# click Run rather than just call .run().
+#
+# Because the cost is one-time, charge it to a one-time warmup instead of to whichever
+# test happens to run first. That keeps the per-run bound tight, which matters because
+# the bound is per test, not per suite: at 60s a hang would cost 82 tests x 60s = 82
+# minutes and CI would hit ci.yml's 15-minute job cap with no pytest report at all --
+# strictly worse than the 3s default it replaced. At 8s that worst case is ~11 minutes
+# and still reports. 8s is ~3x the slowest test measured here (~2.5s, and that one is
+# slow for its own reasons -- decoding a deliberately invalid image -- not from this
+# import); a typical warmed run is ~0.03s. Raising it trades that headroom against the
+# multiplier above, so re-do the arithmetic before nudging it up.
+APP_RUN_TIMEOUT = 8
+
+# The warmup pays the pandas/pyarrow import, so it alone needs the generous bound.
+APP_WARMUP_TIMEOUT = 60
+
+
+def _app_test(timeout: float = APP_RUN_TIMEOUT) -> AppTest:
+    """Build this app's AppTest with a cold-start-safe timeout.
+
+    Every AppTest in the suite is constructed here so no call site can silently fall
+    back to the 3s default -- a bare ``AppTest.from_file`` passes warm and fails cold,
+    i.e. green locally and red in CI. Pinned by ``TestAppTestHarness`` in
+    tests/test_streamlit_app.py, which scans every module under tests/.
+    """
+    return AppTest.from_file(APP_PATH, default_timeout=timeout)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _warm_streamlit_once():
+    """Import Streamlit's dataframe stack once, before any test is timed.
+
+    Drives the cheapest generation path there is (Ask: no image, one mocked chunk) far
+    enough to render model output, which is what triggers the pandas/pyarrow import.
+    Without this the charge lands on whichever test generates first, which is why a
+    cold venv fails it.
+
+    Session-scoped, so it cannot use the function-scoped ``monkeypatch`` fixture;
+    ``pytest.MonkeyPatch.context()`` gives the same undo on exit. A hang in this path
+    surfaces here as one ``APP_WARMUP_TIMEOUT`` failure that errors the module
+    immediately, rather than 82 tests each burning their own timeout. ``AppTest.run``
+    captures app exceptions on ``at.exception`` rather than raising, so a timeout is
+    the only thing that fails this fixture.
+    """
+    chunk = MagicMock()
+    chunk.text = "warmup"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mlx_vlm.load", lambda *a, **k: (MagicMock(), MagicMock()))
+        mp.setattr("mlx_vlm.utils.load_config", lambda *a, **k: {})
+        mp.setattr("mlx_vlm.prompt_utils.apply_chat_template", lambda *a, **k: "prompt")
+        mp.setattr("mlx_vlm.stream_generate", lambda *a, **k: iter([chunk]))
+        at = _app_test(timeout=APP_WARMUP_TIMEOUT)
+        at.run()
+        at.text_input(key="ask_prompt").set_value("warmup").run()
+        at.button(key="ask_run").click().run()
+    # Drop the warmup's cached mock model and its stored result so neither leaks into
+    # the first real test (_clear_caches does this per test, but runs after this one).
+    st.cache_resource.clear()
+    st.cache_data.clear()
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
@@ -74,7 +147,7 @@ def patched_mlx(monkeypatch):
 @pytest.fixture
 def app(patched_mlx):
     """A freshly-run AppTest with the model mocked."""
-    return AppTest.from_file(APP_PATH).run()
+    return _app_test().run()
 
 
 @pytest.fixture
@@ -275,7 +348,7 @@ def test_ask_streams_deltas_and_renders_answer_once(patched_mlx, monkeypatch):
             yield chunk
 
     monkeypatch.setattr("mlx_vlm.stream_generate", _stream)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("What is a fracture?").run()
     at.button(key="ask_run").click().run()
     assert not at.exception
@@ -293,7 +366,7 @@ def test_ask_empty_generation_renders_without_crashing(patched_mlx, monkeypatch)
         yield  # unreachable — the yield only makes this a zero-chunk generator
 
     monkeypatch.setattr("mlx_vlm.stream_generate", _empty_stream)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("hi").run()
     at.button(key="ask_run").click().run()
     assert not at.exception
@@ -303,7 +376,7 @@ def test_ask_empty_generation_renders_without_crashing(patched_mlx, monkeypatch)
 
 def test_ask_thinking_trace_renders(patched_mlx):
     patched_mlx.text = "<unused94>thought\nLet me reason.<unused95>Final answer."
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("Why?").run()
     at.toggle(key="ask_thinking").set_value(True).run()
     at.button(key="ask_run").click().run()
@@ -315,7 +388,7 @@ def test_ask_thinking_trace_renders(patched_mlx):
 
 def test_ask_thinking_no_markers_no_expander(patched_mlx):
     patched_mlx.text = "Just a plain reply without markers."
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("Why?").run()
     at.toggle(key="ask_thinking").set_value(True).run()
     at.button(key="ask_run").click().run()
@@ -330,7 +403,7 @@ def test_ask_inference_failure_renders_error(patched_mlx, monkeypatch):
         raise RuntimeError("model exploded")
 
     _patch_stream(monkeypatch, _raise)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("Why?").run()
     at.button(key="ask_run").click().run()
     assert not at.exception
@@ -345,7 +418,7 @@ def test_repetition_penalty_passed_to_generate(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "ok"
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_kwargs=k) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("Why?").run()
     at.button(key="ask_run").click().run()
     assert not at.exception
@@ -362,7 +435,7 @@ def test_ask_passes_no_image_to_model(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "No acute findings."
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_args=a) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("What is a fracture?").run()
     at.button(key="ask_run").click().run()
     assert not at.exception
@@ -374,7 +447,7 @@ def test_ask_result_persists_across_rerun(patched_mlx):
     # Regression for the vanish-on-rerun bug: a result must survive a later widget
     # interaction that does not re-click Run (before the session-state fix, the
     # early-return on a False button wiped the response).
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("What is a fracture?").run()
     at.button(key="ask_run").click().run()
     assert "No acute findings." in [m.value for m in at.markdown]
@@ -390,7 +463,7 @@ def test_ask_does_not_rerun_inference_on_unrelated_rerun(patched_mlx, monkeypatc
     out = MagicMock()
     out.text = "Cached answer."
     _patch_stream(monkeypatch, lambda *a, **k: calls.append(1) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("Why?").run()
     at.button(key="ask_run").click().run()
     assert len(calls) == 1
@@ -403,7 +476,7 @@ def test_ask_does_not_rerun_inference_on_unrelated_rerun(patched_mlx, monkeypatc
 def test_ask_stale_result_cleared_when_prompt_changes(patched_mlx):
     # Persistence must not outlive the inputs: editing the prompt without clicking
     # Run drops the now-stale answer (its stored signature no longer matches).
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ask_prompt").set_value("What is a fracture?").run()
     at.button(key="ask_run").click().run()
     assert "No acute findings." in [m.value for m in at.markdown]
@@ -506,7 +579,7 @@ def test_cxr_image_inference_passes_image_to_model(patched_mlx, monkeypatch, png
     out = MagicMock()
     out.text = "No acute findings."
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_args=a) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Describe this X-ray").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.button(key="cxr_run").click().run()
@@ -521,7 +594,7 @@ def test_cxr_localization_lists_detected_structures(patched_mlx, png_bytes):
     patched_mlx.text = (
         '```json\n[{"box_2d": [100, 100, 500, 500], "label": "right clavicle"}]\n```'
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Where is the right clavicle?").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_localize").set_value(True).run()
@@ -546,7 +619,7 @@ def test_cxr_localization_passes_square_image_to_model(patched_mlx, monkeypatch)
     )
     buf = io.BytesIO()
     Image.new("RGB", (20, 10)).save(buf, format="PNG")  # non-square -> padding visible
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Localize the frame").run()
     at.file_uploader(key="cxr_image1").upload(
         "wide.png", buf.getvalue(), "image/png"
@@ -564,7 +637,7 @@ def test_cxr_localization_passes_square_image_to_model(patched_mlx, monkeypatch)
 
 def test_cxr_localization_no_boxes_warns(patched_mlx, png_bytes):
     patched_mlx.text = "I could not localize that structure."
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Where is the spine?").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_localize").set_value(True).run()
@@ -578,7 +651,7 @@ def test_cxr_localization_with_thinking_renders_both(patched_mlx, png_bytes):
         "<unused94>thought\nReasoning about anatomy.<unused95>"
         '```json\n[{"box_2d": [100, 100, 500, 500], "label": "bone"}]\n```'
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Locate the bone").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_thinking").set_value(True).run()
@@ -597,7 +670,7 @@ def test_cxr_localization_renders_full_frame_box(patched_mlx, png_bytes):
     patched_mlx.text = (
         '```json\n[{"box_2d": [0, 0, 1000, 1000], "label": "femur"}]\n```'
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Where is the femur?").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_localize").set_value(True).run()
@@ -619,7 +692,7 @@ def test_cxr_comparison_passes_both_images(patched_mlx, monkeypatch, png_bytes):
     out = MagicMock()
     out.text = "The second study shows interval improvement."
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_args=a) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these studies").run()
     at.file_uploader(key="cxr_image1").upload(
         "before.png", png_bytes, "image/png"
@@ -640,7 +713,7 @@ def test_cxr_comparison_uses_larger_token_budget(patched_mlx, monkeypatch, png_b
     out = MagicMock()
     out.text = "Comparison."
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_kwargs=k) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these").run()
     at.file_uploader(key="cxr_image1").upload(
         "before.png", png_bytes, "image/png"
@@ -665,7 +738,7 @@ def test_cxr_comparison_with_thinking_renders_both(patched_mlx, monkeypatch, png
     _patch_stream(
         monkeypatch, lambda *a, **k: captured.update(gen_kwargs=k) or patched_mlx
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these studies").run()
     at.file_uploader(key="cxr_image1").upload(
         "before.png", png_bytes, "image/png"
@@ -742,7 +815,7 @@ def test_cxr_stale_localization_toggle_runs_comparison_with_two_images(
     out = MagicMock()
     out.text = "Both lungs are clear."
     _patch_stream(monkeypatch, lambda *a, **k: captured.update(gen_kwargs=k) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these").run()
     at.file_uploader(key="cxr_image1").upload(
         "before.png", png_bytes, "image/png"
@@ -768,7 +841,7 @@ def test_cxr_comparison_sends_unpadded_images(patched_mlx, monkeypatch):
     buf = io.BytesIO()
     Image.new("RGB", (20, 10)).save(buf, format="PNG")
     wide_png = buf.getvalue()
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these").run()
     at.file_uploader(key="cxr_image1").upload("a.png", wide_png, "image/png").run()
     at.file_uploader(key="cxr_image2").upload("b.png", wide_png, "image/png").run()
@@ -787,7 +860,7 @@ def test_cxr_comparison_labels_images_in_prompt(patched_mlx, monkeypatch, png_by
     out = MagicMock()
     out.text = "Comparison."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Compare these").run()
     at.file_uploader(key="cxr_image1").upload(
         "before.png", png_bytes, "image/png"
@@ -806,7 +879,7 @@ def test_cxr_result_persists_across_rerun(patched_mlx, monkeypatch, png_bytes):
     out = MagicMock()
     out.text = "No acute findings."
     _patch_stream(monkeypatch, lambda *a, **k: calls.append(1) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Describe this X-ray").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.button(key="cxr_run").click().run()
@@ -826,7 +899,7 @@ def test_cxr_localization_persists_across_rerun(patched_mlx, png_bytes):
     patched_mlx.text = (
         '```json\n[{"box_2d": [100, 100, 500, 500], "label": "right clavicle"}]\n```'
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Where is the right clavicle?").run()
     at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_localize").set_value(True).run()
@@ -842,7 +915,7 @@ def test_cxr_localization_persists_across_rerun(patched_mlx, png_bytes):
 def test_cxr_stale_text_result_cleared_when_second_image_added(patched_mlx, png_bytes):
     # A single-image answer must not linger once a second image switches the tab to
     # comparison mode (the result's signature includes the second upload).
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Describe this X-ray").run()
     at.file_uploader(key="cxr_image1").upload("a.png", png_bytes, "image/png").run()
     at.button(key="cxr_run").click().run()
@@ -861,7 +934,7 @@ def test_cxr_stale_localization_cleared_when_localize_toggled_off(
     patched_mlx.text = (
         '```json\n[{"box_2d": [100, 100, 500, 500], "label": "rib"}]\n```'
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="cxr_prompt").set_value("Where is the rib?").run()
     at.file_uploader(key="cxr_image1").upload("x.png", png_bytes, "image/png").run()
     at.toggle(key="cxr_localize").set_value(True).run()
@@ -913,7 +986,7 @@ def test_ct_inference_passes_windowed_slices(patched_mlx, monkeypatch):
         monkeypatch,
         lambda *a, **k: captured.update(gen_args=a, gen_kwargs=k) or out,
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Are there hypodense lesions?").run()
     _upload_ct_pair(at)
     at.button(key="ct_run").click().run()
@@ -942,7 +1015,7 @@ def test_ct_labels_slices_in_prompt(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Describe the volume").run()
     _upload_ct_pair(at)
     at.button(key="ct_run").click().run()
@@ -962,7 +1035,7 @@ def test_ct_with_thinking_uses_larger_budget(patched_mlx, monkeypatch):
         monkeypatch,
         lambda *a, **k: captured.update(gen_kwargs=k) or patched_mlx,
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Any lesions?").run()
     _upload_ct_pair(at)
     at.toggle(key="ct_thinking").set_value(True).run()
@@ -976,7 +1049,7 @@ def test_ct_with_thinking_uses_larger_budget(patched_mlx, monkeypatch):
 
 
 def test_ct_invalid_dicom_shows_error(patched_mlx):
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Describe this").run()
     at.file_uploader(key="ct_files").upload(
         "bad.dcm", b"not-a-dicom", "application/dicom"
@@ -1002,7 +1075,7 @@ def test_ct_subsamples_to_slider_count(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Describe the volume").run()
     uploader = at.file_uploader(key="ct_files")
     for i in range(1, 7):  # six single-series slices
@@ -1018,19 +1091,19 @@ def test_ct_subsamples_to_slider_count(patched_mlx, monkeypatch):
 
 def test_ct_slider_default_reflects_ram(patched_mlx, monkeypatch):
     _force_ram_gib(monkeypatch, 32)  # ram_aware_slice_cap -> (default 10, max 20)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     assert at.slider(key="ct_slices").value == 10
 
 
 def test_ct_memory_capped_shows_caption_not_slider(patched_mlx, monkeypatch):
     _force_ram_gib(monkeypatch, 16)  # below base + headroom -> (2, 2): no slider
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     assert "ct_slices" not in [w.key for w in at.slider]
     assert any("Limited memory" in c.value for c in at.caption)
 
 
 def test_ct_rejects_mixed_series_with_error(patched_mlx):
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Describe").run()
     at.file_uploader(key="ct_files").upload(
         "a.dcm", _dicom_bytes(1, 100, series_uid="1.2.3"), "application/dicom"
@@ -1046,7 +1119,7 @@ def test_ct_rejects_mixed_series_with_error(patched_mlx):
 def test_ct_multi_frame_shows_error_not_crash(patched_mlx):
     # A multi-frame DICOM (3D pixel array) must surface the friendly error, not an
     # unhandled traceback from window_ct_slice.
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Describe").run()
     at.file_uploader(key="ct_files").upload(
         "vol.dcm", _dicom_bytes(1, 100, frames=3), "application/dicom"
@@ -1062,7 +1135,7 @@ def test_ct_result_persists_across_rerun(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "Two contiguous slices of the liver."
     _patch_stream(monkeypatch, lambda *a, **k: calls.append(1) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Any lesions?").run()
     _upload_ct_pair(at)
     at.button(key="ct_run").click().run()
@@ -1079,7 +1152,7 @@ def test_ct_stale_result_cleared_when_slice_count_changes(patched_mlx, monkeypat
     out = MagicMock()
     out.text = "Liver findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="ct_prompt").set_value("Any lesions?").run()
     _upload_ct_pair(at)
     at.button(key="ct_run").click().run()
@@ -1126,7 +1199,7 @@ def test_wsi_inference_passes_patches(patched_mlx, patched_openslide, monkeypatc
         monkeypatch,
         lambda *a, **k: captured.update(gen_args=a, gen_kwargs=k) or out,
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.slider(key="wsi_patches").set_value(4).run()
@@ -1156,7 +1229,7 @@ def test_wsi_labels_patches_in_prompt(patched_mlx, patched_openslide, monkeypatc
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.slider(key="wsi_patches").set_value(3).run()
@@ -1180,7 +1253,7 @@ def test_wsi_subsamples_to_slider_count(patched_mlx, patched_openslide, monkeypa
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.slider(key="wsi_patches").set_value(6).run()
@@ -1193,7 +1266,7 @@ def test_wsi_caption_discloses_actual_magnification(
     patched_mlx, patched_openslide, monkeypatch
 ):
     _force_ram_gib(monkeypatch, 32)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
@@ -1214,7 +1287,7 @@ def test_wsi_with_thinking_uses_larger_budget(
         monkeypatch,
         lambda *a, **k: captured.update(gen_kwargs=k) or patched_mlx,
     )
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Any malignancy?").run()
     _upload_slide(at)
     at.toggle(key="wsi_thinking").set_value(True).run()
@@ -1232,7 +1305,7 @@ def test_wsi_invalid_slide_shows_error(patched_mlx, monkeypatch):
         raise OSError("not a slide")
 
     monkeypatch.setattr("openslide.OpenSlide", _boom)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
@@ -1244,7 +1317,7 @@ def test_wsi_invalid_slide_shows_error(patched_mlx, monkeypatch):
 def test_wsi_no_tissue_shows_error(patched_mlx, monkeypatch):
     white = Image.new("RGB", (800, 800), (255, 255, 255))
     monkeypatch.setattr("openslide.OpenSlide", lambda path: _FakeSlide(thumbnail=white))
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
@@ -1268,7 +1341,7 @@ def test_wsi_magnification_selects_pyramid_level(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.segmented_control(key="wsi_mag").set_value(10).run()
@@ -1296,7 +1369,7 @@ def test_wsi_sparse_tissue_reduces_patch_count(patched_mlx, monkeypatch):
     out = MagicMock()
     out.text = "Findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.slider(key="wsi_patches").set_value(8).run()  # request 8, only 3 qualify
@@ -1312,7 +1385,7 @@ def test_wsi_result_persists_across_rerun(patched_mlx, patched_openslide, monkey
     out = MagicMock()
     out.text = "Moderately differentiated adenocarcinoma."
     _patch_stream(monkeypatch, lambda *a, **k: calls.append(1) or out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
@@ -1338,7 +1411,7 @@ def test_wsi_stale_result_cleared_when_magnification_changes(
     out = MagicMock()
     out.text = "Adenocarcinoma."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
@@ -1360,7 +1433,7 @@ def test_wsi_stale_result_cleared_when_patch_count_changes(
     out = MagicMock()
     out.text = "Adenocarcinoma."
     _patch_stream(monkeypatch, lambda *a, **k: out)
-    at = AppTest.from_file(APP_PATH).run()
+    at = _app_test().run()
     at.text_input(key="wsi_prompt").set_value("Describe the slide").run()
     _upload_slide(at)
     at.button(key="wsi_run").click().run()

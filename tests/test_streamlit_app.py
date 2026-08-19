@@ -3,6 +3,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tomllib
@@ -1549,6 +1550,57 @@ class TestReleaseWorkflow:
                 )
 
 
+class TestAppTestHarness:
+    """Guard the AppTest harness in tests/test_app_ui.py against a silent revert.
+
+    ``streamlit.testing.v1.AppTest`` bounds each script run with a 3s
+    ``default_timeout``, which the first run in a freshly created venv blows (see the
+    comment on ``APP_RUN_TIMEOUT``). tests/test_app_ui.py routes every construction
+    through ``_app_test()`` so the whole suite inherits a safe bound -- but a new test
+    reaching for the raw constructor gets the 3s default back, passes on a warm dev
+    machine, and fails only in CI, where the venv is always cold. Nothing else in the
+    suite would catch that, so pin it here.
+
+    This lives beside the other checked-in-asset guards (TestCiWorkflow, TestClaudeMd,
+    ...) rather than inside test_app_ui.py both to keep that file to UI flow and so the
+    scan covers EVERY module under tests/ -- a second AppTest-based module would
+    otherwise reintroduce the flake with the guard still green.
+    """
+
+    TESTS_DIR = Path(__file__).resolve().parent
+
+    # Any AppTest constructor, not just from_file: from_string/from_function take the
+    # same default_timeout and would reintroduce the same flake.
+    CONSTRUCTOR = re.compile(r"AppTest\.from_(?:file|string|function)\s*\(")
+
+    # test_app_ui.py gets exactly one: the call inside _app_test() itself.
+    ALLOWED = {"test_app_ui.py": 1}
+
+    def test_apptests_are_built_only_by_the_shared_helper(self):
+        offenders = {}
+        for path in sorted(self.TESTS_DIR.glob("*.py")):
+            found = len(self.CONSTRUCTOR.findall(path.read_text(encoding="utf-8")))
+            if found != self.ALLOWED.get(path.name, 0):
+                offenders[path.name] = found
+        assert not offenders, (
+            f"AppTest constructed outside _app_test(): {offenders}; build every "
+            "AppTest via tests.test_app_ui._app_test() so its timeout applies"
+        )
+
+    def test_helper_applies_a_timeout_clear_of_a_cold_start(self):
+        # The helper is only worth pinning if it actually raises the bound: guard both
+        # that the per-run budget beats AppTest's 3s default and that the one-time
+        # warmup is generous enough for the ~16-24s cold first run.
+        from tests.test_app_ui import APP_RUN_TIMEOUT, APP_WARMUP_TIMEOUT, _app_test
+
+        assert APP_RUN_TIMEOUT > 3, "per-run budget no longer beats AppTest's default"
+        assert APP_WARMUP_TIMEOUT >= 30, "warmup budget too tight for a cold first run"
+        assert _app_test().default_timeout == APP_RUN_TIMEOUT
+        assert (
+            _app_test(timeout=APP_WARMUP_TIMEOUT).default_timeout == APP_WARMUP_TIMEOUT
+        )
+
+
 class TestClaudeMd:
     """Guard CLAUDE.md, the project context file loaded into every session. Like
     TestThemeConfig/TestHooksConfig/TestCiWorkflow, this checks a real checked-in asset
@@ -1654,6 +1706,29 @@ class TestClaudeMd:
             assert hasattr(streamlit_app, name), (
                 f"CLAUDE.md documents {name}, but it no longer exists in streamlit_app"
             )
+
+    def test_documented_test_harness_symbols_exist(self):
+        # test_documented_spine_symbols_exist resolves names against streamlit_app, so
+        # it cannot see the harness symbols the Gotchas section leans on. Without this,
+        # renaming _app_test or APP_RUN_TIMEOUT leaves CLAUDE.md describing a harness
+        # that no longer exists while the whole suite stays green -- exactly the silent
+        # drift this class exists to prevent, just on the test side of the fence.
+        import tests.test_app_ui as ui
+
+        text = self._text()
+        for name in (
+            "_app_test",
+            "_warm_streamlit_once",
+            "APP_RUN_TIMEOUT",
+            "APP_WARMUP_TIMEOUT",
+        ):
+            assert name in text, f"harness symbol {name} dropped from CLAUDE.md"
+            assert hasattr(ui, name), (
+                f"CLAUDE.md documents {name}, but it no longer exists in test_app_ui"
+            )
+        # The guard class lives in this module.
+        assert "TestAppTestHarness" in text
+        assert "TestAppTestHarness" in globals()
 
 
 class TestDocsMatchSource:
