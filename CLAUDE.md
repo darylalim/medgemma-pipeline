@@ -19,7 +19,7 @@ When working with Python, invoke the relevant `/astral:<skill>` (`/astral:uv`, `
 
 ## Architecture
 
-`main()` loads the model once (`@st.cache_resource load_model()` → `mlx_vlm.load()` + `load_config()` → `(model, processor, config)`; model `mlx-community/medgemma-1.5-4b-it-bf16`) and renders a research-only safety disclaimer (`DISCLAIMER_TEXT`, a persistent `st.warning`) above four `st.tabs`, each delegating to a `@st.fragment`-decorated `render_*_tab` with its own keyed widgets:
+`main()` loads the model once (`@st.cache_resource load_model()` → `mlx_vlm.load()` + `load_config()` → `(model, processor, config)`; model `mlx-community/medgemma-1.5-4b-it-8bit`) and renders a research-only safety disclaimer (`DISCLAIMER_TEXT`, a persistent `st.warning`) above four `st.tabs`, each delegating to a `@st.fragment`-decorated `render_*_tab` with its own keyed widgets:
 
 - **Ask** (`render_ask_tab`) — text-only Q&A. `DEFAULT_INSTRUCTION_TEXT`.
 - **Chest X-ray** (`render_cxr_tab`) — single image; two-image **comparison** (both in one prompt labeled "First/Second image:", previewed in `st.columns(2)`, `DEFAULT_INSTRUCTION_COMPARE`, 600-token budget); or anatomy **localization** (single image only — padded to square, `LOCALIZATION_INSTRUCTION` asks for `[y0,x0,y1,x1]` boxes normalized to `[0,1000]`, then parsed → scaled → drawn → cropped back). Comparison and localization are mutually exclusive.
@@ -36,7 +36,7 @@ CT and WSI share a 2000-token budget (2500 with thinking) and the same shape: pr
 - `normalize_hu`, `window_ct_slice` — CT windowing; `CT_WINDOWS` (wide/soft-tissue/brain → R/G/B) is the model's **trained** CT format, so it is fixed, not user-tunable
 - `subsample_indices` — uniform slice/patch indices, endpoints included
 - `load_ct_volume` — reads per-slice DICOMs, sorts by InstanceNumber, `seek(0)`-rewinds each upload before `dcmread`, converts to HU via `apply_rescale`
-- `ram_aware_slice_cap` — `(default, max)` slice/patch counts scaled to installed RAM (`(8,16)` on 32 GiB, hard max 64); RAM detection memoized via `_cached_total_ram_gib`
+- `ram_aware_slice_cap` — `(default, max)` slice/patch counts scaled to installed RAM (`(10,20)` on 32 GiB, hard max 64); RAM detection memoized via `_cached_total_ram_gib`
 - WSI: `mag_from_mpp`, `effective_magnification`, `pick_level`, `patch_grid` (non-overlapping 896px tiles, partial edges dropped), `tissue_mask` (saturation proxy `max−min(RGB)` excludes glass), `tissue_patches` (keep ≥25% tissue), `mark_patches`, `load_wsi_patches` (OpenSlide loader; `read_region` takes a **level-0** location but a target-level size; raises `ValueError` for unreadable / too-small / no-tissue slides)
 
 **UI helpers** (touch Streamlit):

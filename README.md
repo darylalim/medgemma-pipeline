@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/darylalim/medgemma-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/darylalim/medgemma-studio/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/darylalim/medgemma-studio)](https://github.com/darylalim/medgemma-studio/releases) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Streamlit application for analyzing medical text and images using Google [MedGemma](https://huggingface.co/mlx-community/medgemma-1.5-4b-it-bf16) on Apple Silicon with MLX. Inference runs entirely on-device — no image, scan, or slide ever leaves your Mac.
+Streamlit application for analyzing medical text and images using Google [MedGemma](https://huggingface.co/mlx-community/medgemma-1.5-4b-it-8bit) on Apple Silicon with MLX. Inference runs entirely on-device — no image, scan, or slide ever leaves your Mac.
 
 ![MedGemma Studio's Chest X-ray tab: an uploaded chest radiograph above the model's radiology-style findings.](docs/screenshot.webp)
 
@@ -35,9 +35,9 @@ Requires:
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
 - **16 GB unified memory** minimum (comfortable for the Ask and Chest X-ray tabs); **32 GB or more recommended** for the Computed Tomography and Pathology tabs, whose multi-image inference is memory-heavy — the app automatically caps how many CT slices / WSI patches it analyzes to fit your RAM
-- **~9 GB free disk** for the model weights
+- **~6 GB free disk** for the model weights
 
-The model ([`mlx-community/medgemma-1.5-4b-it-bf16`](https://huggingface.co/mlx-community/medgemma-1.5-4b-it-bf16), ~9 GB) downloads from Hugging Face on first run. The repo is ungated, so no token is required. Whole-slide pathology support needs no extra setup — OpenSlide's native library ships as a prebuilt Apple Silicon wheel (no Homebrew).
+The model ([`mlx-community/medgemma-1.5-4b-it-8bit`](https://huggingface.co/mlx-community/medgemma-1.5-4b-it-8bit), ~6 GB) downloads from Hugging Face on first run — an 8-bit MLX quantization of `google/medgemma-1.5-4b-it` that leaves the vision encoder at bf16, so image understanding runs unquantized. The repo is ungated, so no token is required. Whole-slide pathology support needs no extra setup — OpenSlide's native library ships as a prebuilt Apple Silicon wheel (no Homebrew).
 
 ```bash
 uv sync

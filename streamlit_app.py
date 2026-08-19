@@ -19,7 +19,7 @@ from pydicom.pixels import apply_rescale
 
 load_dotenv()
 
-MODEL_ID = "mlx-community/medgemma-1.5-4b-it-bf16"
+MODEL_ID = "mlx-community/medgemma-1.5-4b-it-8bit"
 
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 
@@ -333,14 +333,20 @@ def _cached_total_ram_gib() -> float:
 def ram_aware_slice_cap(total_ram_gib: float | None = None) -> tuple[int, int]:
     """Return ``(default, max)`` CT slice counts scaled to installed memory.
 
-    Each windowed slice costs ~0.5 GB of peak GPU memory over a ~13 GB base
-    (measured: medgemma-1.5-4b-bf16 on a 32 GiB M2 Max — 16 slices peaked
-    ~20.7 GB, 32 slices OOMed). A fixed headroom is reserved for the OS, and the
-    max is clamped to a practical ceiling. On a 32 GiB machine this yields (8, 16).
+    Measured for the 8-bit weights on a 32 GiB M2 Max: ~6.9 GB base + ~0.55 GB
+    per windowed slice (16 slices peaked ~15.8 GB). The constants below round
+    both terms up — 9 GB and 0.6 GB/slice — so the cap sits ~2 GB clear of that
+    fit rather than on it: the curve is not perfectly linear (MLX reuses cached
+    buffers) and other Macs will differ. Quantization shrank the weights, not
+    the per-slice activations, so only the base term moved down from the bf16
+    figures these replace (13 GB + 0.5 GB/slice; 16 slices peaked ~20.7 GB and
+    32 slices OOMed). A fixed headroom is reserved for the OS, and the max is
+    clamped to a practical ceiling. On a 32 GiB machine this yields (10, 20);
+    machines at 18 GiB and below sit on the 2-slice floor.
     """
     if total_ram_gib is None:
         total_ram_gib = _cached_total_ram_gib()
-    base_gib, per_slice_gib, headroom_gib, hard_max = 13.0, 0.5, 11.0, 64
+    base_gib, per_slice_gib, headroom_gib, hard_max = 9.0, 0.6, 11.0, 64
     budget = total_ram_gib - base_gib - headroom_gib
     max_slices = max(2, min(hard_max, int(budget / per_slice_gib)))
     default = max(2, max_slices // 2)

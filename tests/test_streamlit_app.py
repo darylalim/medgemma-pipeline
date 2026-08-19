@@ -519,12 +519,12 @@ class TestLoadCtVolume:
 
 
 class TestRamAwareSliceCap:
-    def test_32gib_yields_8_and_16(self):
-        assert ram_aware_slice_cap(total_ram_gib=32) == (8, 16)
+    def test_32gib_yields_10_and_20(self):
+        assert ram_aware_slice_cap(total_ram_gib=32) == (10, 20)
 
     def test_scales_up_with_more_ram(self):
         default, maximum = ram_aware_slice_cap(total_ram_gib=64)
-        assert maximum > 16
+        assert maximum > 20
         assert default <= maximum
 
     def test_clamped_to_hard_max(self):

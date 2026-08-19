@@ -991,7 +991,7 @@ def test_ct_invalid_dicom_shows_error(patched_mlx):
 def test_ct_subsamples_to_slider_count(patched_mlx, monkeypatch):
     # The slider value (not the upload count) drives how many windowed slices reach
     # the model: upload 6, request 4, expect 4.
-    _force_ram_gib(monkeypatch, 32)  # deterministic slider range (max 16)
+    _force_ram_gib(monkeypatch, 32)  # deterministic slider range (max 20)
     captured = {}
     monkeypatch.setattr(
         "mlx_vlm.prompt_utils.apply_chat_template",
@@ -1015,9 +1015,9 @@ def test_ct_subsamples_to_slider_count(patched_mlx, monkeypatch):
 
 
 def test_ct_slider_default_reflects_ram(patched_mlx, monkeypatch):
-    _force_ram_gib(monkeypatch, 32)  # ram_aware_slice_cap -> (default 8, max 16)
+    _force_ram_gib(monkeypatch, 32)  # ram_aware_slice_cap -> (default 10, max 20)
     at = AppTest.from_file(APP_PATH).run()
-    assert at.slider(key="ct_slices").value == 8
+    assert at.slider(key="ct_slices").value == 10
 
 
 def test_ct_memory_capped_shows_caption_not_slider(patched_mlx, monkeypatch):
@@ -1073,7 +1073,7 @@ def test_ct_result_persists_across_rerun(patched_mlx, monkeypatch):
 
 
 def test_ct_stale_result_cleared_when_slice_count_changes(patched_mlx, monkeypatch):
-    _force_ram_gib(monkeypatch, 32)  # slider default 8, max 16
+    _force_ram_gib(monkeypatch, 32)  # slider default 10, max 20
     out = MagicMock()
     out.text = "Liver findings."
     _patch_stream(monkeypatch, lambda *a, **k: out)
@@ -1112,7 +1112,7 @@ def test_wsi_run_requires_prompt_and_file(app):
 
 
 def test_wsi_inference_passes_patches(patched_mlx, patched_openslide, monkeypatch):
-    _force_ram_gib(monkeypatch, 32)  # deterministic slider range (max 16)
+    _force_ram_gib(monkeypatch, 32)  # deterministic slider range (max 20)
     captured = {}
     monkeypatch.setattr(
         "mlx_vlm.prompt_utils.apply_chat_template",
@@ -1363,7 +1363,7 @@ def test_wsi_stale_result_cleared_when_patch_count_changes(
     _upload_slide(at)
     at.button(key="wsi_run").click().run()
     assert "Adenocarcinoma." in [m.value for m in at.markdown]
-    at.slider(key="wsi_patches").set_value(4).run()  # default 8 -> 4, no re-run
+    at.slider(key="wsi_patches").set_value(4).run()  # default 10 -> 4, no re-run
     assert not at.exception
     assert "Adenocarcinoma." not in [m.value for m in at.markdown]
     assert any("Inputs changed" in i.value for i in at.info)  # dropped with a hint
