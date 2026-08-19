@@ -2,7 +2,7 @@
   "permissions": {
     "deny": [
       "Read(.env)",
-      "Read(.env.*)",
+      "Read(.env.local)",
       "Read(.streamlit/secrets.toml)"
     ]
   },
@@ -24,15 +24,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1; out=$(uv run ruff check \"$f\" 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py) cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1; out=$(uv run ruff check \"$f\" 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
           },
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run ty check 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py) cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run ty check 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
           },
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in *.py|*.toml|*/.claude/settings.json) mkdir -p \"$CLAUDE_PROJECT_DIR/.claude\" && touch \"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\" ;; esac; exit 0"
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py|*.toml|*/.claude/settings.json) mkdir -p \"$CLAUDE_PROJECT_DIR/.claude\" && touch \"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\" ;; esac; exit 0"
           }
         ]
       }
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"$(jq -r '.stop_hook_active // false')\" = \"true\" ] && exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; s=\"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\"; [ -f \"$s\" ] || exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run pytest -q -x --tb=short 2>&1) || { echo \"Tests are failing — fix before finishing:\" >&2; echo \"$out\" | tail -n 40 >&2; exit 2; }; rm -f \"$s\"; exit 0"
+            "command": "[ \"$(jq -r '.stop_hook_active // false')\" = \"true\" ] && exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; s=\"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\"; [ -f \"$s\" ] || exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run pytest -q --maxfail=3 --tb=short 2>&1) || { echo \"Tests are failing — fix before finishing:\" >&2; echo \"$out\" | tail -n 40 >&2; exit 2; }; rm -f \"$s\"; exit 0"
           }
         ]
       }

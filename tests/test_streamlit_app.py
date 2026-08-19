@@ -1,4 +1,5 @@
 import dataclasses
+import fnmatch
 import inspect
 import io
 import json
@@ -1064,13 +1065,14 @@ class TestHooksConfig:
 
     SETTINGS = Path(__file__).resolve().parent.parent / ".claude" / "settings.json"
 
-    def _hooks(self) -> dict:
-        with open(self.SETTINGS) as f:
-            return json.load(f)["hooks"]  # raises if not valid JSON / no "hooks"
+    def _settings(self) -> dict:
+        # Explicit encoding: the commands embed em-dashes, so the platform default would
+        # raise UnicodeDecodeError under a non-UTF-8 locale and error out the class.
+        with open(self.SETTINGS, encoding="utf-8") as f:
+            return json.load(f)  # raises if not valid JSON
 
-    def _commands_for(self, event: str) -> str:
-        # Join every command string configured under one event, for intent checks.
-        return " ".join(h["command"] for g in self._hooks()[event] for h in g["hooks"])
+    def _hooks(self) -> dict:
+        return self._settings()["hooks"]  # raises if there is no "hooks"
 
     def test_settings_exists_and_parses(self):
         assert self.SETTINGS.is_file()
@@ -1127,13 +1129,23 @@ class TestHooksConfig:
         # Reads are denied declaratively, which also stops `cat .env` through Bash --
         # exfiltration being the worse direction for a token. Protection that moved into
         # settings.json must not quietly move back out.
-        with open(self.SETTINGS) as f:
-            deny = set(json.load(f)["permissions"]["deny"])
+        deny = set(self._settings()["permissions"]["deny"])
         assert {
             "Read(.env)",
-            "Read(.env.*)",
+            "Read(.env.local)",
             "Read(.streamlit/secrets.toml)",
         } <= deny
+        # Deliberately enumerated, never a `.env.*` wildcard: a Read deny rule ALSO
+        # blocks Edit and Write on the same path (Claude Code >= 2.1.228), and an allow
+        # rule cannot rescue a denied path -- so a wildcard would silently make
+        # .env.example uncreatable, turning the guard's carve-out arm below, and its
+        # test pin, into dead configuration that still reports green.
+        for rule in deny:
+            pattern = rule[rule.index("(") + 1 : rule.rindex(")")]
+            for template in (".env.example", ".env.sample", ".env.template"):
+                assert not fnmatch.fnmatch(template, pattern), (
+                    f"{rule} would also block writes to {template}"
+                )
 
     # --- Behavioral checks: execute the commands and assert real exit codes ---------
 
@@ -1149,11 +1161,12 @@ class TestHooksConfig:
         return next(c for c in cmds if needle in c)
 
     @staticmethod
-    def _run(command: str, payload: dict, env: dict | None = None):
-        # Run a hook as Claude Code does: the tool-event JSON arrives on stdin.
+    def _run(command: str, payload: dict | str, env: dict | None = None):
+        # Run a hook as Claude Code does: the tool-event JSON arrives on stdin. A str
+        # payload goes through raw, so a malformed event uses this plumbing too.
         return subprocess.run(
             ["/bin/sh", "-c", command],
-            input=json.dumps(payload),
+            input=payload if isinstance(payload, str) else json.dumps(payload),
             text=True,
             capture_output=True,
             env=env,
@@ -1221,12 +1234,7 @@ class TestHooksConfig:
         # An unparseable event, or one with no file_path, is the SAME "I don't know
         # what is being written" condition as a missing jq, and must reach the same
         # verdict. Left to `jq -r ... // empty` it exits 0 and the write sails through.
-        r = subprocess.run(
-            ["/bin/sh", "-c", self._command("PreToolUse")],
-            input=payload,
-            text=True,
-            capture_output=True,
-        )
+        r = self._run(self._command("PreToolUse"), payload)
         assert r.returncode == 2, f"{payload!r}: exit {r.returncode}"
 
     @requires_jq
@@ -1290,7 +1298,8 @@ class TestHooksConfig:
         sentinel.touch()
         bindir = tmp_path / "bin"
         bindir.mkdir()
-        self._shim(bindir, "uv", "exit 0\n")
+        log = tmp_path / "uv-args"
+        self._shim(bindir, "uv", f'echo "$@" >> "{log}"\nexit 0\n')
         r = self._run(
             self._command("Stop"),
             {"stop_hook_active": False},
@@ -1298,11 +1307,22 @@ class TestHooksConfig:
         )
         assert r.returncode == 0
         assert not sentinel.exists()
+        # The gate has to be the SUITE. Every Stop shim here ignores "$@", so without
+        # this the command could be swapped for any other tool and stay green.
+        assert "pytest" in log.read_text()
 
     @requires_jq
     @pytest.mark.parametrize(
         ("rel", "marks"),
-        [("a.py", True), ("pyproject.toml", True), ("notes.md", False)],
+        [
+            ("a.py", True),
+            ("pyproject.toml", True),
+            ("notes.md", False),
+            # A relative path has to resolve against the project root, or the
+            # `*/.claude/settings.json` arm never matches and a hooks change ships
+            # with the suite unrun -- the same fall-open fixed in the guard.
+            (".claude/settings.json", True),
+        ],
     )
     def test_sentinel_hook_marks_testable_edits(self, tmp_path, rel, marks):
         # The PostToolUse sentinel is what tells Stop a testable file changed this turn.
@@ -1310,11 +1330,39 @@ class TestHooksConfig:
         (root / ".claude").mkdir(parents=True)
         r = self._run(
             self._command("PostToolUse", "tests-needed"),
-            {"tool_input": {"file_path": f"/x/{rel}"}},
+            {
+                "tool_input": {"file_path": str(root / rel)}
+                if "/" not in rel
+                else {"file_path": rel}
+            },
             env={**os.environ, "CLAUDE_PROJECT_DIR": str(root)},
         )
         assert r.returncode == 0
         assert (root / ".claude" / ".tests-needed").exists() is marks
+
+    @requires_jq
+    def test_post_edit_hooks_ignore_files_outside_the_project(self, tmp_path):
+        # A scratch .py outside the repo is not ours: linting it with project rules
+        # blocks on unrelated violations, and arming the sentinel bills the ~21s suite
+        # at Stop for a file no test covers. Every PostToolUse hook must opt out.
+        root = tmp_path / "proj"
+        (root / ".claude").mkdir(parents=True)
+        outside = tmp_path / "elsewhere" / "scratch.py"
+        outside.parent.mkdir()
+        outside.write_text("# " + "z" * 300 + "\n")  # unfixable E501
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        self._shim(bindir, "uv", f'touch "{tmp_path}/uv-ran"\nexit 1\n')
+        env = self._hook_env(bindir, root)
+        for needle in ("ruff", "ty check", "tests-needed"):
+            r = self._run(
+                self._command("PostToolUse", needle),
+                {"tool_input": {"file_path": str(outside)}},
+                env=env,
+            )
+            assert r.returncode == 0, f"{needle}: exit {r.returncode}"
+        assert not (tmp_path / "uv-ran").exists()  # no gate was invoked at all
+        assert not (root / ".claude" / ".tests-needed").exists()
 
     @requires_jq
     def test_ruff_hook_runs_on_py_and_skips_others(self, tmp_path):
@@ -1329,7 +1377,7 @@ class TestHooksConfig:
         ruff = self._command("PostToolUse", "ruff")
         assert (
             self._run(
-                ruff, {"tool_input": {"file_path": "/x/a.py"}}, env=env
+                ruff, {"tool_input": {"file_path": str(root / "a.py")}}, env=env
             ).returncode
             == 0
         )
@@ -1338,7 +1386,7 @@ class TestHooksConfig:
         log.unlink()
         assert (
             self._run(
-                ruff, {"tool_input": {"file_path": "/x/a.md"}}, env=env
+                ruff, {"tool_input": {"file_path": str(root / "a.md")}}, env=env
             ).returncode
             == 0
         )
@@ -1354,18 +1402,20 @@ class TestHooksConfig:
         root.mkdir()
         bindir = tmp_path / "bin"
         bindir.mkdir()
-        # Calls 1-2 are `check --fix` and `format` (silent); call 3 is the re-check.
-        c = tmp_path / "call"
+        # Fail only the bare re-check (`ruff check FILE`), never the fixing pass, so
+        # this pins the re-check specifically rather than "the third uv call".
         self._shim(
             bindir,
             "uv",
-            f'[ -e "{c}2" ] && {{ echo "E501 line too long" >&2; exit 1; }}\n'
-            f'[ -e "{c}1" ] && {{ : > "{c}2"; exit 0; }}\n'
-            f': > "{c}1"\nexit 0\n',
+            'case "$*" in\n'
+            "  *'ruff check --fix'*) exit 0 ;;\n"
+            "  *'ruff format'*) exit 0 ;;\n"
+            "  *'ruff check'*) echo 'E501 line too long' >&2; exit 1 ;;\n"
+            "esac\nexit 0\n",
         )
         r = self._run(
             self._command("PostToolUse", "ruff"),
-            {"tool_input": {"file_path": "/x/a.py"}},
+            {"tool_input": {"file_path": str(root / "a.py")}},
             env=self._hook_env(bindir, root),
         )
         assert r.returncode == 2
@@ -1382,11 +1432,15 @@ class TestHooksConfig:
         env = self._hook_env(bindir, root)
         ty = self._command("PostToolUse", "ty check")
         assert (
-            self._run(ty, {"tool_input": {"file_path": "/x/a.py"}}, env=env).returncode
+            self._run(
+                ty, {"tool_input": {"file_path": str(root / "a.py")}}, env=env
+            ).returncode
             == 2
         )
         assert (
-            self._run(ty, {"tool_input": {"file_path": "/x/a.md"}}, env=env).returncode
+            self._run(
+                ty, {"tool_input": {"file_path": str(root / "a.md")}}, env=env
+            ).returncode
             == 0
         )
 
