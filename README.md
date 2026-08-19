@@ -34,7 +34,7 @@ Requires:
 - Mac with Apple Silicon
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
-- **16 GB unified memory** minimum (comfortable for the Ask and Chest X-ray tabs); **32 GB or more recommended** for the Computed Tomography and Pathology tabs, whose multi-image inference is memory-heavy — the app automatically caps how many CT slices / WSI patches it analyzes to fit your RAM
+- **16 GB unified memory** minimum (comfortable for the Ask and Chest X-ray tabs); **24 GB or more** for the Computed Tomography and Pathology tabs, whose multi-image inference is memory-heavy, and **32 GB or more recommended** to analyze a useful number of slices at once — the app automatically caps how many CT slices / WSI patches it analyzes to fit your RAM (2 below 22 GB, 6 at 24 GB, 20 at 32 GB)
 - **~6 GB free disk** for the model weights
 
 The model ([`mlx-community/medgemma-1.5-4b-it-8bit`](https://huggingface.co/mlx-community/medgemma-1.5-4b-it-8bit), ~6 GB) downloads from Hugging Face on first run — an 8-bit MLX quantization of `google/medgemma-1.5-4b-it` that leaves the vision encoder at bf16, so image understanding runs unquantized. The repo is ungated, so no token is required. Whole-slide pathology support needs no extra setup — OpenSlide's native library ships as a prebuilt Apple Silicon wheel (no Homebrew).

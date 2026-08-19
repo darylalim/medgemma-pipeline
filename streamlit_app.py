@@ -25,8 +25,12 @@ IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 
 # Greedy decoding (temperature 0) can fall into degenerate repetition loops on
 # longer generations (e.g. a multi-slice CT read). A repetition penalty over a wide
-# context breaks them while staying deterministic; verified not to corrupt the
-# localization JSON output.
+# context breaks them while staying deterministic. Re-verified on the 8-bit weights:
+# localization still emits well-formed JSON that parse_boxes accepts. It does bias
+# the model toward shorter lists, though — two localize prompts each returned one
+# fewer box with the penalty than without (temperature 0, so the penalty is the only
+# variable), since every extra box repeats the same structural tokens. That is fewer
+# structures returned, not corrupted output.
 REPETITION_PENALTY = 1.3
 REPETITION_CONTEXT_SIZE = 256
 
@@ -334,15 +338,25 @@ def ram_aware_slice_cap(total_ram_gib: float | None = None) -> tuple[int, int]:
     """Return ``(default, max)`` CT slice counts scaled to installed memory.
 
     Measured for the 8-bit weights on a 32 GiB M2 Max: ~6.9 GB base + ~0.55 GB
-    per windowed slice (16 slices peaked ~15.8 GB). The constants below round
-    both terms up — 9 GB and 0.6 GB/slice — so the cap sits ~2 GB clear of that
-    fit rather than on it: the curve is not perfectly linear (MLX reuses cached
-    buffers) and other Macs will differ. Quantization shrank the weights, not
-    the per-slice activations, so only the base term moved down from the bf16
-    figures these replace (13 GB + 0.5 GB/slice; 16 slices peaked ~20.7 GB and
-    32 slices OOMed). A fixed headroom is reserved for the OS, and the max is
-    clamped to a practical ceiling. On a 32 GiB machine this yields (10, 20);
-    machines at 18 GiB and below sit on the 2-slice floor.
+    per windowed slice (16 slices peaked ~15.8 GB). Both terms are rounded up
+    below — 9 GB and 0.6 GB/slice — so the cap sits ~2 GB clear of that fit
+    rather than on it: the curve is not perfectly linear (MLX reuses cached
+    buffers) and other Macs will differ.
+
+    Both terms moved relative to the bf16 tuning these replace (13 GB +
+    0.5 GB/slice; 16 slices peaked ~20.7 GB, 32 slices OOMed), and in opposite
+    directions: quantization shrank the weights but not the per-slice
+    activations, so the base fell while the per-slice cost rose. The two
+    formulas therefore cross at 44 GiB — below it machines gain capacity
+    (32 GiB: (8, 16) -> (10, 20)), above it they lose a little (48 GiB:
+    (24, 48) -> (23, 46)). That is deliberate: 0.5 GB/slice understated the
+    measured cost, so the old cap was over-optimistic exactly where slice
+    counts are highest.
+
+    A fixed headroom is reserved for the OS, and the max is clamped to a
+    practical ceiling. On a 32 GiB machine this yields (10, 20). The 2-slice
+    floor covers everything below 21.8 GB (= base + headroom + one slice), so
+    a 16 GB Mac and a 20 GB Mac both sit on it; 22 GB is the first tier off.
     """
     if total_ram_gib is None:
         total_ram_gib = _cached_total_ram_gib()

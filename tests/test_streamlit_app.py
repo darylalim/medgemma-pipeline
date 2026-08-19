@@ -522,9 +522,22 @@ class TestRamAwareSliceCap:
     def test_32gib_yields_10_and_20(self):
         assert ram_aware_slice_cap(total_ram_gib=32) == (10, 20)
 
+    def test_24gib_unlocks_a_small_slider(self):
+        # The 8-bit retune moved this tier off the 2-slice floor; pin it, since
+        # a 24 GB Mac is the smallest machine that now gets a real slider.
+        assert ram_aware_slice_cap(total_ram_gib=24) == (3, 6)
+
+    def test_floor_extends_to_just_under_21_8_gib(self):
+        # max > 2 needs budget >= 1.8 GB, i.e. base + headroom + one slice.
+        assert ram_aware_slice_cap(total_ram_gib=21) == (2, 2)
+        assert ram_aware_slice_cap(total_ram_gib=22) == (2, 3)
+
     def test_scales_up_with_more_ram(self):
-        default, maximum = ram_aware_slice_cap(total_ram_gib=64)
-        assert maximum > 20
+        # 40 GiB, not 64: at 64 the result is the hard_max clamp, so the
+        # assertion would guard clamping (already covered below) instead of the
+        # scaling this test is named for. int((40 - 9 - 11) / 0.6) == 33.
+        default, maximum = ram_aware_slice_cap(total_ram_gib=40)
+        assert maximum == 33
         assert default <= maximum
 
     def test_clamped_to_hard_max(self):
