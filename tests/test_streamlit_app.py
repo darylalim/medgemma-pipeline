@@ -1050,7 +1050,10 @@ class TestHooksConfig:
     well-formed {type: "command", command} entry whose command is valid shell (checked
     against the real interpreter with `sh -n`, mirroring the theme guard's real-key
     check), and the three configured events must stay wired so a dropped or typo'd hook
-    fails here instead of silently no-op'ing at runtime.
+    fails here instead of silently no-op'ing at runtime. The Edit|Write *matchers* are
+    pinned too -- they are an exact tool-name list, so a lower-cased one disables every
+    hook under it while leaving all the other checks green -- as is the
+    `permissions.deny` block covering the read side of the same secrets.
 
     Beyond those structural checks, the second half of the class runs the hook commands
     behaviorally — piping mock tool-event JSON on stdin and driving them with a fake
@@ -1103,25 +1106,34 @@ class TestHooksConfig:
                         f"invalid shell in hook: {hook['command']}\n{result.stderr}"
                     )
 
-    def test_secret_guard_covers_env_and_lockfile(self):
-        # The PreToolUse guard must keep protecting the HF token, Streamlit secrets, and
-        # the lockfile. (Behaviorally re-verified below; kept as a cheap intent pin.)
-        guard = self._commands_for("PreToolUse")
-        assert ".env" in guard
-        assert "secrets.toml" in guard
-        assert "uv.lock" in guard
+    def test_hook_matchers_target_the_edit_tools(self):
+        # A matcher of plain letters and "|" is an EXACT tool-name list, so a
+        # lower-cased or typo'd matcher ("edit|write") matches nothing and silently
+        # disables the hook with no runtime error. Every other check in this class
+        # stays green through that mutation -- the commands are still present and
+        # still valid shell -- so the matcher itself is what has to be pinned.
+        hooks = self._hooks()
+        for event in ("PreToolUse", "PostToolUse"):
+            for group in hooks[event]:
+                assert set(group["matcher"].split("|")) == {"Edit", "Write"}, (
+                    f"{event}: matcher {group['matcher']!r} matches no tool"
+                )
+        for group in hooks["Stop"]:
+            # Stop carries no tool name; a matcher here would never match.
+            assert "matcher" not in group
 
-    def test_edit_hooks_run_formatter_and_type_checker(self):
-        # PostToolUse on an edit must keep invoking both ruff and ty.
-        post = self._commands_for("PostToolUse")
-        assert "ruff" in post
-        assert "ty check" in post
-
-    def test_stop_hook_runs_tests_with_loop_guard(self):
-        # The Stop hook must run pytest AND guard the infinite stop->fix loop.
-        stop = self._commands_for("Stop")
-        assert "pytest" in stop
-        assert "stop_hook_active" in stop
+    def test_permissions_deny_protects_secret_reads(self):
+        # The PreToolUse guard below covers the WRITE side (and only for Edit/Write).
+        # Reads are denied declaratively, which also stops `cat .env` through Bash --
+        # exfiltration being the worse direction for a token. Protection that moved into
+        # settings.json must not quietly move back out.
+        with open(self.SETTINGS) as f:
+            deny = set(json.load(f)["permissions"]["deny"])
+        assert {
+            "Read(.env)",
+            "Read(.env.*)",
+            "Read(.streamlit/secrets.toml)",
+        } <= deny
 
     # --- Behavioral checks: execute the commands and assert real exit codes ---------
 
@@ -1163,25 +1175,31 @@ class TestHooksConfig:
 
     @requires_jq
     @pytest.mark.parametrize(
-        ("rel", "expected"),
+        ("path", "expected"),
         [
-            (".env", 2),  # the HF-token file
-            (".env.local", 2),  # dotenv variant
-            (".ENV", 2),  # case-insensitive volume -> same file
-            (".streamlit/secrets.toml", 2),
+            ("/proj/.env", 2),  # the HF-token file
+            ("/proj/.env.local", 2),  # dotenv variant
+            ("/proj/.ENV", 2),  # case-insensitive volume -> same file
+            ("/proj/.streamlit/secrets.toml", 2),
+            ("/proj/uv.lock", 2),
+            ("/proj/.env.example", 0),  # template must stay editable
+            ("/proj/streamlit_app.py", 0),
+            ("/proj/README.md", 0),
+            # Bare names: Edit/Write pass absolute paths today, but a guard whose arms
+            # are all anchored "*/" falls OPEN on every relative one, and a suite that
+            # only ever sends "/proj/..." can never see it.
+            (".env", 2),
             ("uv.lock", 2),
-            (".env.example", 0),  # template must stay editable
+            (".streamlit/secrets.toml", 2),
+            (".env.example", 0),
             ("streamlit_app.py", 0),
-            ("README.md", 0),
         ],
     )
-    def test_pretooluse_guard_blocks_protected_allows_normal(self, rel, expected):
+    def test_pretooluse_guard_blocks_protected_allows_normal(self, path, expected):
         # Execute the guard with a mock Edit payload; assert it blocks (2) / allows (0).
-        r = self._run(
-            self._command("PreToolUse"), {"tool_input": {"file_path": f"/proj/{rel}"}}
-        )
+        r = self._run(self._command("PreToolUse"), {"tool_input": {"file_path": path}})
         assert r.returncode == expected, (
-            f"{rel}: exit {r.returncode} (stderr: {r.stderr})"
+            f"{path}: exit {r.returncode} (stderr: {r.stderr})"
         )
         if expected == 2:
             assert "Blocked" in r.stderr
@@ -1196,6 +1214,20 @@ class TestHooksConfig:
             env={**os.environ, "PATH": str(empty)},
         )
         assert r.returncode == 2
+
+    @requires_jq
+    @pytest.mark.parametrize("payload", ["not json", "{}", '{"tool_input": {}}'])
+    def test_pretooluse_guard_fails_closed_on_bad_payload(self, payload):
+        # An unparseable event, or one with no file_path, is the SAME "I don't know
+        # what is being written" condition as a missing jq, and must reach the same
+        # verdict. Left to `jq -r ... // empty` it exits 0 and the write sails through.
+        r = subprocess.run(
+            ["/bin/sh", "-c", self._command("PreToolUse")],
+            input=payload,
+            text=True,
+            capture_output=True,
+        )
+        assert r.returncode == 2, f"{payload!r}: exit {r.returncode}"
 
     @requires_jq
     def test_stop_hook_skips_pytest_when_hook_active(self, tmp_path):
@@ -1216,7 +1248,7 @@ class TestHooksConfig:
 
     @requires_jq
     def test_stop_hook_skips_pytest_without_sentinel(self, tmp_path):
-        # Change gate: no testable edit this turn -> no sentinel -> skip the ~11s suite.
+        # Change gate: no testable edit this turn -> no sentinel -> skip the ~21s suite.
         root = tmp_path / "proj"
         (root / ".claude").mkdir(parents=True)
         bindir = tmp_path / "bin"
@@ -1311,6 +1343,33 @@ class TestHooksConfig:
             == 0
         )
         assert not log.exists()  # uv not called for a non-.py file
+
+    @requires_jq
+    def test_ruff_hook_blocks_on_residual_violation(self, tmp_path):
+        # `ruff check --fix` repairs most things but not all -- E501 on a long comment
+        # is this repo's most frequent lint failure, and `ruff format` won't rescue it.
+        # Fixing silently and discarding the exit code sends it straight to CI, so the
+        # hook re-checks afterwards and blocks (exit 2) on whatever survived.
+        root = tmp_path / "proj"
+        root.mkdir()
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        # Calls 1-2 are `check --fix` and `format` (silent); call 3 is the re-check.
+        c = tmp_path / "call"
+        self._shim(
+            bindir,
+            "uv",
+            f'[ -e "{c}2" ] && {{ echo "E501 line too long" >&2; exit 1; }}\n'
+            f'[ -e "{c}1" ] && {{ : > "{c}2"; exit 0; }}\n'
+            f': > "{c}1"\nexit 0\n',
+        )
+        r = self._run(
+            self._command("PostToolUse", "ruff"),
+            {"tool_input": {"file_path": "/x/a.py"}},
+            env=self._hook_env(bindir, root),
+        )
+        assert r.returncode == 2
+        assert "E501" in r.stderr
 
     @requires_jq
     def test_ty_hook_surfaces_errors_on_py_only(self, tmp_path):

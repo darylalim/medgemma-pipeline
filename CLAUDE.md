@@ -49,11 +49,12 @@ CT and WSI share a 2000-token budget (2500 with thinking) and the same shape: pr
 
 ## Claude Code hooks
 
-`.claude/settings.json` (shared) runs the same gates automatically; guarded structurally **and** behaviorally (executes each command, asserts exit codes) by `TestHooksConfig`:
+`.claude/settings.json` (shared) runs the same gates automatically; guarded structurally **and** behaviorally (executes each command, asserts exit codes) by `TestHooksConfig`. All hooks under one matcher run **in parallel**, so the per-`.py`-edit cost is `max()`, not `sum()` — ~0.64s, of which `ty check` is ~99%:
 
-- **PreToolUse** (`Edit`/`Write`) — blocks writes to `.env`/`.env.*` (except `.env.example`/`.sample`/`.template`), `.streamlit/secrets.toml`, `uv.lock`. Case-insensitive; **fails closed** if `jq` is absent. Accident-guard only (does not intercept `Bash` writes).
-- **PostToolUse** (`Edit`/`Write`) — on `.py`: `ruff check --fix` + `ruff format` (silent) then `ty check` (surfaces errors back to fix). Writes a `.claude/.tests-needed` sentinel (gitignored) on any `.py`/`.toml`/`.claude/settings.json` edit.
-- **Stop** — if the sentinel exists, runs `uv run pytest`; clears it on pass, blocks + feeds output back on fail. Skipped on docs-only turns; `stop_hook_active` guards against a stop→fix loop.
+- **`permissions.deny`** — `Read(.env)`, `Read(.env.*)`, `Read(.streamlit/secrets.toml)`. The **read** side, declarative: it also blocks `cat .env` through `Bash`, which no `Edit`/`Write` hook can see. It can't replace the write guard below — a deny rule carries no allowlist exceptions, so `Edit(./.env.*)` would also block `.env.example`.
+- **PreToolUse** (`Edit`/`Write`) — blocks **writes** to `.env`/`.env.*` (except `.env.example`/`.sample`/`.template`), `.streamlit/secrets.toml`, `uv.lock`. Case-insensitive; matches relative as well as absolute paths; **fails closed** if `jq` is absent *or* the event has no parseable `file_path`. Accident-guard only (does not intercept `Bash` writes).
+- **PostToolUse** (`Edit`/`Write`) — on `.py`: `ruff check --fix` + `ruff format` (silent) then a **blocking `ruff check` re-check** (exit 2 on whatever `--fix` can't repair — E501 on a long comment is the common one, and `ruff format` doesn't rescue it); separately `ty check` (whole project — scoping it to one file is *slower*, the cost is fixed startup). A third, separate entry writes a `.claude/.tests-needed` sentinel (gitignored) on any `.py`/`.toml`/`.claude/settings.json` edit — it stays separate **on purpose**, since folding it into the `ty` command would let that hook's `exit 2` short-circuit the `touch` and silently disarm the Stop gate.
+- **Stop** — if the sentinel exists, runs `uv run pytest -q -x --tb=short` (~21s green; `-x --tb=short` keeps the *failure* path fast and makes the `tail -n 40` fed back actually name the defect, instead of 40 truncated `FAILED …` lines); clears the sentinel on pass, blocks + feeds output back on fail. Skipped on turns with no pending sentinel — so a docs-only turn is free, though one *following an interrupted code turn* still pays the suite. `stop_hook_active` guards against a stop→fix loop.
 
 Personal overrides go in `.claude/settings.local.json` (gitignored).
 

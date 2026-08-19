@@ -1,4 +1,11 @@
 {
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(.streamlit/secrets.toml)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -6,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v jq >/dev/null 2>&1 || { echo \"secret guard: jq not found — failing closed.\" >&2; exit 2; }; f=$(jq -r '.tool_input.file_path // empty'); fl=$(printf '%s' \"$f\" | tr '[:upper:]' '[:lower:]'); case \"$fl\" in */.env.example|*/.env.sample|*/.env.template) ;; */.env|*/.env.*|*/.streamlit/secrets.toml|*/uv.lock) echo \"Blocked: $f is a protected secret/lock file — edit it manually outside Claude Code.\" >&2; exit 2 ;; esac; exit 0"
+            "command": "command -v jq >/dev/null 2>&1 || { echo \"secret guard: jq not found — failing closed.\" >&2; exit 2; }; f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null) || f=\"\"; [ -n \"$f\" ] || { echo \"secret guard: no file_path in event — failing closed.\" >&2; exit 2; }; case \"$f\" in /*) ;; *) f=\"./$f\" ;; esac; fl=$(printf '%s' \"$f\" | tr '[:upper:]' '[:lower:]'); case \"$fl\" in */.env.example|*/.env.sample|*/.env.template) ;; */.env|*/.env.*|*/.streamlit/secrets.toml|*/uv.lock) echo \"Blocked: $f is a protected secret/lock file — edit it manually outside Claude Code.\" >&2; exit 2 ;; esac; exit 0"
           }
         ]
       }
@@ -17,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1 ;; esac; exit 0"
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1; out=$(uv run ruff check \"$f\" 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
           },
           {
             "type": "command",
@@ -35,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"$(jq -r '.stop_hook_active // false')\" = \"true\" ] && exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; s=\"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\"; [ -f \"$s\" ] || exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run pytest -q 2>&1) || { echo \"Tests are failing — fix before finishing:\" >&2; echo \"$out\" | tail -n 40 >&2; exit 2; }; rm -f \"$s\"; exit 0"
+            "command": "[ \"$(jq -r '.stop_hook_active // false')\" = \"true\" ] && exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; s=\"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\"; [ -f \"$s\" ] || exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run pytest -q -x --tb=short 2>&1) || { echo \"Tests are failing — fix before finishing:\" >&2; echo \"$out\" | tail -n 40 >&2; exit 2; }; rm -f \"$s\"; exit 0"
           }
         ]
       }
