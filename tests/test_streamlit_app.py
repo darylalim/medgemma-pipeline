@@ -566,6 +566,20 @@ class TestDetectTotalRamGib:
         )
         assert _detect_total_ram_gib() == 32.0
 
+    def test_sysconf_indeterminate_falls_back_to_sysctl(self, monkeypatch):
+        # POSIX -1 (indeterminate) is returned, not raised, so the try/except alone
+        # would let it through as a negative RAM total.
+        monkeypatch.setattr(
+            os, "sysconf_names", {"SC_PHYS_PAGES": 0, "SC_PAGE_SIZE": 1}
+        )
+        monkeypatch.setattr(os, "sysconf", lambda n: -1)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(stdout=f"{64 * 1024**3}\n"),
+        )
+        assert _detect_total_ram_gib() == 64.0
+
     def test_sysctl_fallback_when_sysconf_unavailable(self, monkeypatch):
         # No sysconf keys -> parse `sysctl -n hw.memsize`.
         monkeypatch.setattr(os, "sysconf_names", {})
@@ -1668,6 +1682,34 @@ class TestDocsMatchSource:
             assert streamlit_app.MODEL_ID in doc, (
                 f"{name} does not document MODEL_ID {streamlit_app.MODEL_ID!r}"
             )
+
+    def test_slice_cap_tiers_match_source(self):
+        # ram_aware_slice_cap is the single source of truth for the CT/WSI tiers, and
+        # both docs quote them in their own formats. Deriving the expected strings
+        # here means a retune that forgets either doc fails, the same way a model swap
+        # does above -- this closes a gap where the same numbers were hand-maintained
+        # in CLAUDE.md, the docstring, and five test comments with nothing pinning them.
+        default_32, max_32 = ram_aware_slice_cap(total_ram_gib=32)
+        _, max_24 = ram_aware_slice_cap(total_ram_gib=24)
+        floor = ram_aware_slice_cap(total_ram_gib=2)[1]
+        # First whole GiB tier that clears the 2-slice floor.
+        boundary = next(
+            g for g in range(2, 129) if ram_aware_slice_cap(total_ram_gib=g)[1] > floor
+        )
+        docs = dict(self._docs())
+        expected = {
+            "CLAUDE.md": [f"`({default_32},{max_32})` on 32 GiB"],
+            "README.md": [
+                f"{floor} below {boundary} GB",
+                f"{max_24} at 24 GB",
+                f"{max_32} at 32 GB",
+            ],
+        }
+        for name, fragments in expected.items():
+            for fragment in fragments:
+                assert fragment in docs[name], (
+                    f"{name} does not document the slice-cap tier {fragment!r}"
+                )
 
     def test_wsi_extensions_match_source(self):
         # Every accepted WSI extension (streamlit_app.WSI_TYPES) must appear in both

@@ -310,7 +310,13 @@ def _detect_total_ram_gib() -> float:
     names = getattr(os, "sysconf_names", {})
     if "SC_PHYS_PAGES" in names and "SC_PAGE_SIZE" in names:
         try:
-            return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
+            pages, page_size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+            # POSIX allows -1 for an indeterminate limit, which Python returns rather
+            # than raising. Without this check a negative total would skip the sysctl
+            # fallback silently and floor ram_aware_slice_cap at 2 slices on any
+            # machine, with nothing in the UI to explain it.
+            if pages > 0 and page_size > 0:
+                return pages * page_size / 1024**3
         except (ValueError, OSError):
             pass
     try:
@@ -603,7 +609,9 @@ st.set_page_config(
 )
 
 
-def run_model(model, processor, config, messages, images, max_new_tokens):
+def run_model(
+    model, processor, config, messages, images, max_new_tokens, penalize_repetition=True
+):
     """Stream generation live and return the full accumulated response text.
 
     Tokens are streamed via ``mlx_vlm.stream_generate`` through ``st.write_stream``
@@ -628,6 +636,22 @@ def run_model(model, processor, config, messages, images, max_new_tokens):
         st.error(f"Inference failed: {e}", icon=":material/error:")
         return None
 
+    # The localization path opts out. The penalty cannot tell a degenerate loop from
+    # legitimate schema repetition, and every extra box repeats the same structural
+    # tokens ('{"box_2d": [', '"label"'), so it truncates the JSON list. Measured
+    # over 8 localize prompts on the 8-bit weights at temperature 0: 14 boxes with the
+    # penalty vs 19 without, one prompt returning nothing parseable with it and boxes
+    # without, and no duplicate labels or token-cap runs either way -- i.e. the looping
+    # it guards against did not appear on this path. Long CT/WSI reads keep it.
+    penalty_kwargs = (
+        {
+            "repetition_penalty": REPETITION_PENALTY,
+            "repetition_context_size": REPETITION_CONTEXT_SIZE,
+        }
+        if penalize_repetition
+        else {}
+    )
+
     def _deltas():
         for chunk in stream_generate(
             model,
@@ -636,8 +660,7 @@ def run_model(model, processor, config, messages, images, max_new_tokens):
             image_for_model,  # ty: ignore[invalid-argument-type]
             max_tokens=max_new_tokens,
             temperature=0.0,
-            repetition_penalty=REPETITION_PENALTY,
-            repetition_context_size=REPETITION_CONTEXT_SIZE,
+            **penalty_kwargs,
         ):
             # stream_generate yields GenerationResult chunks; its return annotation
             # mislabels them as str, so the .text access needs a suppression.
@@ -867,7 +890,13 @@ def render_cxr_tab(model, processor, config):
             prompt, full_instruction, model_images, image_labels=image_labels
         )
         raw = run_model(
-            model, processor, config, messages, model_images, max_new_tokens
+            model,
+            processor,
+            config,
+            messages,
+            model_images,
+            max_new_tokens,
+            penalize_repetition=not localize,
         )
         # Persist the finished run (see render_ask_tab). For localization, parse the
         # boxes and draw the annotation once here — strip any thinking trace with

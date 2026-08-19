@@ -555,9 +555,11 @@ def test_cxr_localization_passes_square_image_to_model(patched_mlx, monkeypatch)
     at.button(key="cxr_run").click().run()
     assert not at.exception
     assert captured["gen_args"][3][0].size == (20, 20)  # padded to a square
-    # The loop-guard penalty applies to the localization path too.
-    assert captured["gen_kwargs"]["repetition_penalty"] == REPETITION_PENALTY
-    assert captured["gen_kwargs"]["repetition_context_size"] == REPETITION_CONTEXT_SIZE
+    # The localization path opts OUT of the loop-guard penalty: it taxes the structural
+    # tokens every extra box repeats, truncating the JSON list. Every other path still
+    # asserts the penalty is passed, so this stays a deliberate exception.
+    assert "repetition_penalty" not in captured["gen_kwargs"]
+    assert "repetition_context_size" not in captured["gen_kwargs"]
 
 
 def test_cxr_localization_no_boxes_warns(patched_mlx, png_bytes):

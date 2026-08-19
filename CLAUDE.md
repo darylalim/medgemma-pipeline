@@ -41,7 +41,7 @@ CT and WSI share a 2000-token budget (2500 with thinking) and the same shape: pr
 
 **UI helpers** (touch Streamlit):
 - `load_uploaded_image` — `image.load()` forces the decode so invalid data fails here, not later at `st.image`
-- `run_model` — streams via `mlx_vlm.stream_generate` through `st.write_stream`, returns the accumulated string; passes `REPETITION_PENALTY`/`REPETITION_CONTEXT_SIZE`; `temperature=0` (deterministic)
+- `run_model` — streams via `mlx_vlm.stream_generate` through `st.write_stream`, returns the accumulated string; passes `REPETITION_PENALTY`/`REPETITION_CONTEXT_SIZE` unless `penalize_repetition=False` (the localization path opts out — the penalty truncates the JSON box list); `temperature=0` (deterministic)
 - `render_thought` — thinking trace → expander, returns the answer
 - `tab_settings` — per-tab system instruction + thinking toggle (independent session-state keys) in a collapsed "Model settings" expander
 
