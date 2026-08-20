@@ -1009,10 +1009,11 @@ class TestMlxVlmContract:
 
 
 class TestThemeConfig:
-    """Guard the .streamlit/config.toml clinical theme. Like TestMlxVlmContract, this
-    checks a real asset (not a mock): the file must parse, define BOTH [theme.light]
-    and [theme.dark] (Streamlit only offers the light/dark auto-switch when both
-    exist), and use only theme keys the installed Streamlit recognizes."""
+    """Guard the .streamlit/config.toml nord theme. Like TestMlxVlmContract, this
+    checks a real asset (not a mock): the file must parse, stay locked to a SINGLE mode
+    (Streamlit offers the light/dark switch only when both [theme.light] and
+    [theme.dark] exist, so neither may come back), and use only theme keys the
+    installed Streamlit recognizes."""
 
     CONFIG = Path(__file__).resolve().parent.parent / ".streamlit" / "config.toml"
 
@@ -1024,13 +1025,21 @@ class TestThemeConfig:
         assert self.CONFIG.is_file()
         assert isinstance(self._theme(), dict)  # raises if not valid TOML / no [theme]
 
-    def test_defines_both_light_and_dark_modes(self):
-        # Both subsections are required for the OS/browser auto-switch; dropping
-        # either silently locks the app to a single mode.
+    def test_locks_a_single_mode(self):
+        # The inverse of the auto-switch guard this replaced, and the point of the
+        # current theme: Streamlit renders the light/dark switch in the settings menu
+        # only when BOTH [theme.light] and [theme.dark] exist, so re-adding either one
+        # silently restores the toggle the config is shaped to remove.
         theme = self._theme()
-        assert "light" in theme and "dark" in theme
+        present = [mode for mode in ("light", "dark") if mode in theme]
+        assert not present, f"per-mode sections {present} would re-enable the toggle"
+        # Everything the palette does not override is seeded from `base`, so a locked
+        # theme without one mixes dark surfaces with light-built-in derived accents.
+        assert theme.get("base") in {"light", "dark"}, "locked theme needs a base"
 
-    def test_both_modes_define_the_core_palette(self):
+    def test_defines_the_core_palette(self):
+        # With no per-mode subsections there is no other section left to carry the
+        # core colors -- they have to live in [theme] itself.
         theme = self._theme()
         core = {
             "primaryColor",
@@ -1038,17 +1047,36 @@ class TestThemeConfig:
             "secondaryBackgroundColor",
             "textColor",
         }
-        for mode in ("light", "dark"):
-            assert core <= set(theme[mode]), f"[theme.{mode}] is missing core colors"
+        assert core <= set(theme), "[theme] is missing core colors"
+
+    def test_loads_no_external_assets(self):
+        # Inference is fully on-device, so the theme must not be what puts a request
+        # on the wire. nord's stock `font`/`codeFont` pull Inter and JetBrains Mono
+        # from fonts.googleapis.com on every page load; they are dropped on purpose,
+        # and Streamlit's bundled defaults (Source Sans / Source Code, plus the
+        # Material Symbols face) are served from its own static bundle instead. A
+        # value-level URL check, so re-pasting the template wholesale fails here.
+        remote: list[str] = []
+
+        def walk(section: dict, prefix: str) -> None:
+            for key, value in section.items():
+                path = f"{prefix}.{key}"
+                if isinstance(value, dict):
+                    walk(value, path)
+                elif isinstance(value, str) and "//" in value:
+                    remote.append(path)
+
+        walk(self._theme(), "theme")
+        assert not remote, f"theme keys fetch remote assets: {remote}"
 
     def test_only_uses_recognized_theme_keys(self):
         # Cross-check every key against the theme options the installed Streamlit
         # registers, so a typo'd or removed key fails here instead of degrading to a
         # silent startup warning (mirrors the mlx-vlm contract guard's intent). Each
-        # leaf is checked at its FULL scoped path (e.g. "theme.light.primaryColor"),
-        # so a top-level-only key misplaced in [theme.light] is caught, and a valid
-        # nested table like [theme.light.sidebar] is recursed into rather than
-        # misread as an unknown leaf.
+        # leaf is checked at its FULL scoped path (e.g. "theme.sidebar.textColor"),
+        # so a top-level-only key misplaced in a subsection is caught, and a valid
+        # nested table like [theme.sidebar] is recursed into rather than misread as
+        # an unknown leaf.
         from streamlit import config as st_config
 
         opts = set(st_config.get_config_options())

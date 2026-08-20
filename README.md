@@ -24,7 +24,7 @@ Using MedGemma through this app is subject to Google's [Health AI Developer Foun
 - Staged progress feedback while reading a DICOM series or a whole-slide image, before generation begins
 - RAM-aware cap on CT slices / WSI patches (multi-image inference is memory-heavy on unified memory)
 - Results stay visible across reruns and clear — with a hint — when you change the inputs
-- Clinical light/dark theme that follows your system (OS/browser) appearance
+- Nord dark theme — a calm, low-glare surround for reading medical images
 - Fully local inference on Apple Silicon via MLX
 
 ## Setup
