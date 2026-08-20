@@ -1061,15 +1061,19 @@ def render_cxr_tab(model, processor, config):
             st.image(result["annotated"], caption="Localized anatomy", width="stretch")
             st.divider()
             st.markdown("### Detected structures")
-            # The boxes are drawn on the image above, so list the labels plainly
-            # rather than the raw normalized coordinates (cryptic to a clinician).
+            # The boxes are drawn on the image above, so list the labels rather
+            # than the raw normalized coordinates (cryptic to a clinician). Badges
+            # wrap into a compact legend instead of a bullet per box, keeping the
+            # annotated image and its labels on screen together. A ']' inside a
+            # model-emitted label would terminate the directive early, so strip it.
             st.markdown(
-                "\n".join(
-                    f"- **{box['label'] or 'unlabeled'}**" for box in result["boxes"]
+                " ".join(
+                    f":blue-badge[{(box['label'] or 'unlabeled').replace(']', ' ')}]"
+                    for box in result["boxes"]
                 )
             )
         else:
-            st.warning("No bounding boxes were returned.")
+            st.warning("No bounding boxes were returned.", icon=":material/search_off:")
             show_response(response)
     else:
         show_response(response)
@@ -1089,6 +1093,11 @@ def render_ct_tab(model, processor, config):
     dicom_files = st.file_uploader(
         "Upload CT DICOM slices",
         accept_multiple_files=True,
+        # No type= filter on purpose: per-slice DICOMs off a PACS or a study CD are
+        # routinely extensionless. Say so, since this is the only uploader of the
+        # four whose dropzone lists no accepted types.
+        help="Files may be extensionless (e.g. IM_0001) — a .dcm extension is not "
+        "required.",
         key="ct_files",
     )
 
@@ -1322,7 +1331,7 @@ def main():
         [
             ":material/forum: Ask",
             ":material/radiology: Chest X-ray",
-            ":material/readiness_score: Computed Tomography",
+            ":material/readiness_score: Computed tomography",
             ":material/biotech: Pathology (WSI)",
         ]
     )

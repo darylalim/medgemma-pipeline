@@ -259,7 +259,7 @@ def test_four_tabs_render(app):
     assert [t.label for t in app.tabs] == [
         ":material/forum: Ask",
         ":material/radiology: Chest X-ray",
-        ":material/readiness_score: Computed Tomography",
+        ":material/readiness_score: Computed tomography",
         ":material/biotech: Pathology (WSI)",
     ]
 
