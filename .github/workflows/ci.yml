@@ -11,7 +11,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseding a stale PR run is right; superseding a main run is not. A cancelled
+  # run reports "cancelled", not "failure", so nothing surfaces -- the commit lands on
+  # main having never passed the gates, and tag-and-release.yml, which publishes only
+  # off a SUCCESSFUL CI run, silently skips it.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
@@ -22,11 +26,23 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Nothing here pushes, so keep the token out of .git/config -- the steps
+          # below execute ~100 third-party packages' build and import code.
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          # Pinned deliberately: `uv sync --locked` errors unless uv.lock is exactly
+          # what the RUNNING uv would produce, so an unpinned uv lets an upstream
+          # release turn a green PR red with no repo change -- and the failure is
+          # indistinguishable from a genuinely stale lock. Bump with `uv lock`.
+          version: "0.12.5"
+          # Narrower than setup-uv's default, which also keys on pyproject.toml: a
+          # pyproject edit that leaves the resolution alone (ruff rules, [project.urls])
+          # shouldn't evict 86 packages. enable-cache is left at its `auto` default --
+          # that already resolves to on for a GitHub-hosted runner, so stating it is noise.
           cache-dependency-glob: uv.lock
 
       - name: Sync (locked)

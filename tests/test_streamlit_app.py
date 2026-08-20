@@ -1445,22 +1445,37 @@ class TestHooksConfig:
         )
 
 
-class TestCiWorkflow:
-    """Guard the .github/workflows/ci.yml GitHub Actions workflow. Like TestThemeConfig
-    and TestHooksConfig, this checks a real checked-in asset (not a mock): the file must
-    parse as YAML, run every job on an Apple-Silicon (macOS/arm64) runner matching the
-    MLX target, and drive the SAME four gates the local hooks enforce (ruff check, ruff
-    format --check, ty check, pytest) via a locked `uv sync`. It also pins the security
-    property that no workflow expression reaches a shell `run:` step, so a future edit
-    that introduces a command-injection sink fails here instead of shipping."""
+WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
-    WORKFLOW = (
-        Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
-    )
+# The literal concurrency group release.yml and tag-and-release.yml both declare.
+# Groups are repository-wide, so sharing one is what makes the manual and the automatic
+# publisher mutually exclusive -- a hand-pushed tag landing while CI's auto-release is
+# mid-publish queues behind it instead of racing it.
+PUBLISH_GROUP = "publish-release"
+
+
+class _WorkflowGuard:
+    """Shared plumbing for the three checked-in GitHub Actions guards below.
+
+    Each subclass points ``WORKFLOW`` at one file under ``.github/workflows/`` and
+    inherits the parsing helpers plus the three properties EVERY workflow in this repo
+    must hold: no ``${{ }}`` expression reaches a shell ``run:`` step (the classic
+    Actions command-injection sink), no job or step opts out of blocking, and no job
+    widens the token the workflow declares. None of the three is specific to one file,
+    and a third hand-copied set for the auto-release publisher is exactly how one copy
+    drifts from the others.
+
+    Deliberately not named ``Test*``, so pytest collects only the subclasses.
+    """
+
+    WORKFLOW: Path
+
+    # GITHUB_TOKEN scope ordering, for the widening comparison below.
+    _SCOPE_RANK = {"none": 0, "read": 1, "write": 2}
 
     def _doc(self) -> dict:
         # Imported inside the test (like the mlx-vlm contract guards) so a missing dep
-        # or moved path fails only this check, not collection of the whole suite.
+        # or moved path fails only these checks, not collection of the whole suite.
         import yaml
 
         with open(self.WORKFLOW) as f:
@@ -1471,15 +1486,111 @@ class TestCiWorkflow:
         # under both spellings rather than assuming a "on" string key.
         return doc.get("on", doc.get(True))
 
+    def _jobs(self, doc: dict) -> dict:
+        return doc["jobs"]
+
     def _steps(self, doc: dict) -> list[dict]:
-        return [step for job in doc["jobs"].values() for step in job["steps"]]
+        # `.get("steps", [])`, not `job["steps"]`: a job that delegates to a reusable
+        # workflow via `uses:` has no steps at all, and a KeyError there would replace
+        # every assertion message in the class with the same opaque traceback.
+        return [
+            step for job in self._jobs(doc).values() for step in job.get("steps", [])
+        ]
 
     def _run_commands(self, doc: dict) -> str:
         return "\n".join(s["run"] for s in self._steps(doc) if "run" in s)
 
+    def _step_with(self, doc: dict, action: str) -> dict:
+        """The ``with:`` mapping of the first step whose ``uses:`` names ``action``."""
+        for step in self._steps(doc):
+            if str(step.get("uses", "")).startswith(action):
+                return step.get("with") or {}
+        raise AssertionError(f"{self.WORKFLOW.name} has no step using {action}")
+
     def test_workflow_exists_and_parses(self):
         assert self.WORKFLOW.is_file()
         assert isinstance(self._doc(), dict)
+
+    def test_no_expression_flows_into_a_run_step(self):
+        # Injection guard: a ${{ }} expression interpolated into a shell `run:` block is
+        # the classic GitHub Actions command-injection sink. Expressions stay fine in
+        # non-run contexts (concurrency.group, a job `if:`, an `env:` mapping, a `with:`
+        # input) -- none may reach a run command, so every value arrives via env.
+        offenders = [
+            s["run"] for s in self._steps(self._doc()) if "${{" in s.get("run", "")
+        ]
+        assert not offenders, f"expression flows into run step(s): {offenders}"
+
+    def test_no_gate_neutralizes_itself(self):
+        # The other tests prove each gate is PRESENT; this proves none opts out of
+        # blocking. A stray `continue-on-error: true` (silence a flake and forget) keeps
+        # every substring assertion green while the workflow quietly goes advisory --
+        # CI passing on a red suite, or a version-mismatch check that publishes anyway.
+        # Conditional `if:` steps stay legitimate, so only the opt-out is banned.
+        for name, job in self._jobs(self._doc()).items():
+            assert job.get("continue-on-error") is not True, (
+                f"job {name} is non-blocking"
+            )
+            for step in job.get("steps", []):
+                assert step.get("continue-on-error") is not True, (
+                    f"job {name}: step {step.get('name')!r} is non-blocking"
+                )
+
+    def test_no_job_widens_the_workflow_token(self):
+        # The workflow-level `permissions:` block is only a DEFAULT: a job-level
+        # `permissions:` REPLACES it for that job's GITHUB_TOKEN at runtime. Without
+        # this, adding `permissions: {contents: write, id-token: write}` to a job keeps
+        # every other assertion in the class green while the token the file advertises
+        # quietly escalates -- verified by probe against the real files.
+        #
+        # NARROWING stays legal on purpose: `permissions: {}` on a job that needs
+        # nothing is the hardening this suite should encourage, so compare scope RANKS
+        # rather than demanding equality with the workflow default.
+        doc = self._doc()
+        default = doc.get("permissions") or {}
+        for name, job in self._jobs(doc).items():
+            granted = job.get("permissions")
+            if granted is None:
+                continue
+            assert isinstance(granted, dict), (
+                f"job {name} uses the shorthand {granted!r}; spell the scopes out so "
+                "this comparison stays meaningful"
+            )
+            for scope, level in granted.items():
+                have = self._SCOPE_RANK.get(str(level), 2)
+                allowed = self._SCOPE_RANK.get(str(default.get(scope, "none")), 0)
+                assert have <= allowed, (
+                    f"job {name} widens {scope} to {level!r}; the workflow grants "
+                    f"{default.get(scope, 'none')!r}"
+                )
+
+    def test_checkout_does_not_persist_the_token(self):
+        # checkout defaults to writing GITHUB_TOKEN into .git/config. Nothing in this
+        # repo pushes with git -- both publishers go through `gh` with GH_TOKEN from
+        # env -- so the credential has no reason to outlive the step, and in CI the
+        # steps after it execute ~100 third-party packages' build and import code.
+        persisted = self._step_with(self._doc(), "actions/checkout").get(
+            "persist-credentials"
+        )
+        assert persisted is False, (
+            f"{self.WORKFLOW.name}: checkout leaves the token in .git/config"
+        )
+
+
+class TestCiWorkflow(_WorkflowGuard):
+    """Guard the .github/workflows/ci.yml GitHub Actions workflow. Like TestThemeConfig
+    and TestHooksConfig, this checks a real checked-in asset (not a mock): the file must
+    parse as YAML, run every job on an Apple-Silicon (macOS/arm64) runner matching the
+    MLX target, and drive the SAME four gates the local hooks enforce (ruff check, ruff
+    format --check, ty check, pytest) via a locked `uv sync`. The injection, blocking
+    and token-widening properties come from _WorkflowGuard.
+
+    The reproducibility and blast-radius knobs are pinned here too -- the uv version,
+    the cache key, `persist-credentials`, the timeout and the concurrency rule -- an
+    audit found all of them removable with a green suite while CLAUDE.md advertised
+    them as "Guarded by TestCiWorkflow"."""
+
+    WORKFLOW = WORKFLOW_DIR / "ci.yml"
 
     def test_triggers_on_push_main_pr_and_dispatch(self):
         # Dropping any of these silently narrows when CI runs (no PR gating, no manual
@@ -1492,9 +1603,9 @@ class TestCiWorkflow:
         # The app is Apple-Silicon + MLX; every job must run on a macOS (arm64)
         # runner so CI matches dev/prod and the real-mlx-vlm contract test exercises
         # the shipped backend. A stray ubuntu runner would test a different platform.
-        for name, job in self._doc()["jobs"].items():
-            assert str(job["runs-on"]).startswith("macos"), (
-                f"job {name!r} runs on {job['runs-on']!r}, not a macOS runner"
+        for name, job in self._jobs(self._doc()).items():
+            assert str(job.get("runs-on", "")).startswith("macos"), (
+                f"job {name!r} runs on {job.get('runs-on')!r}, not a macOS runner"
             )
 
     def test_runs_the_same_four_gates_as_local_hooks(self):
@@ -1511,74 +1622,79 @@ class TestCiWorkflow:
         # pyproject.toml — the reproducible-install + lockfile-drift guard in one step.
         assert "uv sync --locked" in self._run_commands(self._doc())
 
-    def test_no_expression_flows_into_a_run_step(self):
-        # Injection guard: a ${{ }} expression interpolated into a shell `run:` block is
-        # the classic GitHub Actions command-injection sink. Expressions are fine in
-        # non-run contexts (e.g. concurrency.group), but none may reach a run command.
-        offenders = [
-            s["run"] for s in self._steps(self._doc()) if "${{" in s.get("run", "")
-        ]
-        assert not offenders, f"expression flows into run step(s): {offenders}"
+    def test_uv_itself_is_version_pinned(self):
+        # `uv sync --locked` errors unless uv.lock is exactly what the RUNNING uv would
+        # produce, so an unpinned uv hands an upstream release the power to turn a green
+        # PR red with no repo change -- and that failure is indistinguishable from a
+        # genuinely stale lock. Pin the resolver, not just the resolution.
+        pinned = str(self._step_with(self._doc(), "astral-sh/setup-uv").get("version"))
+        assert re.fullmatch(r"\d+\.\d+\.\d+", pinned), (
+            f"setup-uv version is {pinned!r}, not an exact X.Y.Z pin"
+        )
+
+    def test_cache_key_is_only_the_lockfile(self):
+        # setup-uv's DEFAULT cache-dependency-glob is a seven-pattern list that includes
+        # `**/pyproject.toml`, so reverting to it would evict an 86-package cache on
+        # every ruff-rule or [project.urls] edit. `uv sync --locked` catches lock drift
+        # regardless of what the cache holds, so narrowing here is purely a speed knob.
+        with_ = self._step_with(self._doc(), "astral-sh/setup-uv")
+        assert with_.get("cache-dependency-glob") == "uv.lock", (
+            f"cache key is {with_.get('cache-dependency-glob')!r}, not the lockfile"
+        )
+        # CLAUDE.md states enable-cache is deliberately absent because `auto` already
+        # resolves to on for a GitHub-hosted runner. Pin the absence, or a future
+        # `enable-cache: false` would turn caching off while the doc still claims it on.
+        assert "enable-cache" not in with_, (
+            "enable-cache is set explicitly; CLAUDE.md documents it as absent"
+        )
 
     def test_token_is_least_privilege(self):
         # CI only reads code and runs tests — it never pushes, comments, or releases,
         # so GITHUB_TOKEN is pinned read-only; dropping it would let a compromised dep
         # escalate via a write-scoped token (same threat model as the injection guard).
+        # test_no_job_widens_the_workflow_token covers the job-level override.
         assert self._doc().get("permissions") == {"contents": "read"}
 
-    def test_no_gate_neutralizes_itself(self):
-        # The tests above prove each gate is PRESENT; this proves none opts out of
-        # blocking. A stray `continue-on-error: true` (silence a flaky test and forget)
-        # keeps those substrings green while the badge goes advisory — CI passing on a
-        # red suite. Conditional `if:` steps are legitimate, so only the non-blocking
-        # opt-out is banned, at job and step scope.
-        for name, job in self._doc()["jobs"].items():
-            assert job.get("continue-on-error") is not True, (
-                f"job {name} is non-blocking"
+    def test_every_job_is_time_capped(self):
+        # Without an explicit cap a hung `uv sync` or a wedged AppTest burns the 6h
+        # default on a 10x-multiplier macOS runner. tests/test_app_ui.py sizes
+        # APP_RUN_TIMEOUT to report inside this bound, so the two are coupled.
+        for name, job in self._jobs(self._doc()).items():
+            assert isinstance(job.get("timeout-minutes"), int), (
+                f"job {name} has no timeout-minutes"
             )
-            for step in job["steps"]:
-                assert step.get("continue-on-error") is not True, (
-                    f"job {name}: step {step.get('name')!r} is non-blocking"
-                )
+
+    def test_main_runs_are_never_cancelled(self):
+        # Superseding a stale PR run is right; superseding a main run is not. A
+        # cancelled run reports "cancelled", not "failure", so nothing surfaces: the
+        # commit lands on main having never passed the gates, and tag-and-release.yml
+        # -- which publishes only off a SUCCESSFUL CI run -- silently skips it too.
+        concurrency = self._doc()["concurrency"]
+        assert "github.ref" in concurrency["group"], (
+            "concurrency group is not per-ref, so PRs would cancel each other"
+        )
+        cancel = concurrency["cancel-in-progress"]
+        assert cancel is not True, (
+            "cancel-in-progress: true cancels main runs too, leaving commits unverified"
+        )
+        assert "refs/heads/main" in str(cancel), (
+            f"cancel-in-progress is {cancel!r}; it must exempt refs/heads/main"
+        )
 
 
-class TestReleaseWorkflow:
-    """Guard the .github/workflows/release.yml GitHub Actions workflow — the tag-driven
-    publisher, sibling to the ci.yml guarded by TestCiWorkflow. A checked-in asset, so
-    the file must parse as YAML, fire ONLY on a pushed `v*` tag, hold `contents: write`
-    (a release needs write — but nothing more), verify the pushed tag matches the
-    pyproject version before publishing (the tag==version check lives here, at release
-    time, not as a pytest that would fail between a bump and its tag), and create the
-    release with auto-generated notes. It also re-pins the same injection property as
-    CI: no `${{ }}` expression may reach a shell `run:` step, so the ref_name naming the
-    tag is read via env, never interpolated into a command."""
+class TestReleaseWorkflow(_WorkflowGuard):
+    """Guard .github/workflows/release.yml -- the MANUAL, tag-driven publisher, and the
+    backstop for the automatic one guarded by TestAutoReleaseWorkflow. A checked-in
+    asset, so the file must parse as YAML, fire ONLY on a pushed `v*` tag, hold
+    `contents: write` (a release needs write -- but nothing more), verify the pushed tag
+    matches the pyproject version before publishing (the tag==version check lives here,
+    at release time, not as a pytest that would fail between a bump and its tag), and
+    create the release with auto-generated notes. Since tag-and-release.yml may already
+    have cut the same version, the publish is also pinned as idempotent, and both files
+    are pinned to the one repository-wide concurrency group that keeps them exclusive.
+    """
 
-    WORKFLOW = (
-        Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release.yml"
-    )
-
-    def _doc(self) -> dict:
-        # Imported inside the test (like TestCiWorkflow) so a missing dep or moved path
-        # fails only this check, not collection of the whole suite.
-        import yaml
-
-        with open(self.WORKFLOW) as f:
-            return yaml.safe_load(f)  # raises if not valid YAML
-
-    def _on(self, doc: dict) -> dict:
-        # PyYAML parses the bare `on:` key as the boolean True (YAML 1.1); look it up
-        # under both spellings rather than assuming a string "on" key.
-        return doc.get("on", doc.get(True))
-
-    def _steps(self, doc: dict) -> list[dict]:
-        return [step for job in doc["jobs"].values() for step in job["steps"]]
-
-    def _run_commands(self, doc: dict) -> str:
-        return "\n".join(s["run"] for s in self._steps(doc) if "run" in s)
-
-    def test_workflow_exists_and_parses(self):
-        assert self.WORKFLOW.is_file()
-        assert isinstance(self._doc(), dict)
+    WORKFLOW = WORKFLOW_DIR / "release.yml"
 
     def test_triggers_only_on_version_tags(self):
         # The release must fire on a pushed vX.Y.Z tag and NOT on a branch push (a
@@ -1626,14 +1742,19 @@ class TestReleaseWorkflow:
         assert "--generate-notes" in cmds
         assert "--verify-tag" in cmds
 
-    def test_no_expression_flows_into_a_run_step(self):
-        # Same injection guard as CI: a ${{ }} expression interpolated into a shell
-        # `run:` block is the classic Actions command-injection sink. github.ref_name
-        # (the tag) must reach the script via env, never spliced into the command.
-        offenders = [
-            s["run"] for s in self._steps(self._doc()) if "${{" in s.get("run", "")
-        ]
-        assert not offenders, f"expression flows into run step(s): {offenders}"
+    def test_publish_is_idempotent(self):
+        # tag-and-release.yml normally gets there first, so a hand-pushed tag for an
+        # already-published version must be a quiet no-op, not a red job that looks
+        # like a real failure.
+        assert "gh release view" in self._run_commands(self._doc()), (
+            "release.yml would fail instead of skipping an already-published version"
+        )
+
+    def test_shares_the_repository_wide_publish_group(self):
+        assert self._doc()["concurrency"] == {
+            "group": PUBLISH_GROUP,
+            "cancel-in-progress": False,
+        }
 
     def test_tag_reaches_shell_via_env(self):
         # The positive half of the injection guard: the tag is not merely kept OUT of
@@ -1649,18 +1770,218 @@ class TestReleaseWorkflow:
                 "from github.ref_name via env"
             )
 
-    def test_no_gate_neutralizes_itself(self):
-        # A stray `continue-on-error: true` would let the version-mismatch check pass
-        # silently and publish a mislabeled release. Ban the non-blocking opt-out at
-        # job and step scope (conditional `if:` steps stay legitimate).
-        for name, job in self._doc()["jobs"].items():
-            assert job.get("continue-on-error") is not True, (
-                f"job {name} is non-blocking"
+
+class TestAutoReleaseWorkflow(_WorkflowGuard):
+    """Guard .github/workflows/tag-and-release.yml -- the AUTOMATIC publisher that cuts
+    a release when a version bump reaches main.
+
+    The design it pins is forced by one documented GitHub rule: events triggered by the
+    default GITHUB_TOKEN do not create new workflow runs. A bot-pushed tag is therefore
+    invisible to release.yml's `on: push: tags`, so "tag here, let release.yml publish"
+    cannot work without a standing PAT -- which is why this workflow tags AND publishes
+    in a single `gh release create --target <sha>` call. Every assertion below protects
+    one leg of that: the CI-conclusion gate (nothing publishes off a red or lock-drifted
+    commit), the fork filter, the tested-SHA checkout, the state-based idempotency key,
+    strict X.Y.Z, published-not-drafted, and the shared concurrency group."""
+
+    WORKFLOW = WORKFLOW_DIR / "tag-and-release.yml"
+
+    # The one version-parsing expression that must be byte-identical in both publishers:
+    # if this workflow read the version differently it could cut a tag that the manual
+    # publisher's verify step then rejects -- a disagreement that surfaces only at
+    # publish time.
+    VERSION_PARSE = "grep -m1 '^version = ' pyproject.toml | cut -d'\"' -f2"
+
+    def test_fires_only_on_a_completed_ci_run(self):
+        # No `push:` trigger: it would race CI and publish in seconds while the suite
+        # was still running, which is precisely the gate this workflow exists to keep.
+        on = self._on(self._doc())
+        assert set(on) == {"workflow_run", "workflow_dispatch"}, (
+            f"unexpected triggers: {sorted(on)}"
+        )
+        assert on["workflow_run"]["types"] == ["completed"]
+        # Without the branch filter every pull-request CI run also starts a (skipped)
+        # run here, and a skipped run still occupies a slot in the shared publish group.
+        assert on["workflow_run"]["branches"] == ["main"], (
+            "workflow_run is not filtered to main, so PR CI runs spawn publish runs"
+        )
+
+    def test_gates_on_ci_by_name_not_path(self):
+        # `workflows:` matches ci.yml's `name:` VALUE, not its path. Renaming CI would
+        # silently un-gate this publisher (fail-safe, but invisible), and worse, a
+        # different workflow later named "CI" would gate it instead. Read the name out
+        # of ci.yml so a rename fails HERE rather than drifting into a dead trigger.
+        import yaml
+
+        with open(TestCiWorkflow.WORKFLOW) as f:
+            ci_name = yaml.safe_load(f)["name"]
+        assert self._on(self._doc())["workflow_run"]["workflows"] == [ci_name], (
+            "tag-and-release.yml no longer gates on ci.yml's workflow name"
+        )
+
+    # Pinned as the WHOLE normalised expression rather than as a set of substring
+    # checks. A substring guard is satisfied just as happily when the `&&`s are flipped
+    # to `||` -- which would disable the CI gate and the fork filter at once -- and it
+    # says nothing about the `workflow_dispatch` disjunct. Verified by mutation: with
+    # substring checks, both tightening and DELETING the dispatch clause left the suite
+    # green. The boolean composition is the property, so assert the composition.
+    EXPECTED_IF = (
+        "(github.event_name == 'workflow_dispatch' && "
+        "github.ref == 'refs/heads/main') || "
+        "(github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.event == 'push' && "
+        "github.event.workflow_run.head_branch == 'main' && "
+        "github.event.workflow_run.head_repository.full_name == github.repository)"
+    )
+
+    def test_publishes_only_from_a_green_same_repo_push_to_main(self):
+        # Every conjunct is load-bearing. `head_branch == 'main'` alone is a trap (a
+        # fork's default branch is also called main), and the dispatch leg must stay
+        # ANDed with a main check: as a bare disjunct it let anyone with write access
+        # publish from any branch or tag, because on `workflow_dispatch` github.sha is
+        # the tip of the DISPATCHED ref, which both fallbacks below resolve to.
+        condition = " ".join(self._jobs(self._doc())["release"]["if"].split())
+        assert condition == self.EXPECTED_IF, (
+            f"job `if` changed.\n  is:       {condition}\n"
+            f"  expected: {self.EXPECTED_IF}"
+        )
+
+    def test_checks_out_the_commit_ci_actually_tested(self):
+        # On a workflow_run event, github.sha is the DEFAULT BRANCH tip -- not the
+        # commit CI verified. Checking out github.sha would let a release describe code
+        # that never passed the gates whenever main moved during the run.
+        with_ = self._step_with(self._doc(), "actions/checkout")
+        assert "workflow_run.head_sha" in str(with_.get("ref")), (
+            f"checkout ref is {with_.get('ref')!r}, not the tested SHA"
+        )
+
+    def test_skips_a_version_that_is_already_released(self):
+        # The idempotency key is repository STATE ("is there a release for the version
+        # pyproject.toml claims?"), never a diff. A `git diff HEAD^ HEAD` detector
+        # breaks on squash merges, force pushes, several commits in one push and job
+        # re-runs; a state check survives all four and makes a re-run a safe no-op.
+        cmds = self._run_commands(self._doc())
+        assert "gh release view" in cmds, (
+            "no already-released check — a re-run would try to publish twice"
+        )
+        assert "exit 0" in cmds, "the already-released check never short-circuits"
+
+    def test_tags_the_tested_sha_and_generates_notes(self):
+        # --target <sha> makes `gh release create` mint the tag AND publish in one API
+        # call, so there is no window where the tag exists but the release doesn't.
+        # That is also why --verify-tag is absent here: it requires a pre-existing tag,
+        # and pinning --target to the exact tested SHA is the stronger guarantee.
+        cmds = self._run_commands(self._doc())
+        assert "gh release create" in cmds
+        assert '--target "$SHA"' in cmds, (
+            "release is not pinned to the tested SHA via --target"
+        )
+        assert "--generate-notes" in cmds
+
+    def test_publishes_rather_than_drafting(self):
+        # A draft is absent from the public releases API, so README's shields.io release
+        # badge would freeze on the previous version -- and a draft does not materialise
+        # the git tag until a human clicks Publish.
+        assert "--draft" not in self._run_commands(self._doc())
+
+    def test_only_plain_x_y_z_versions_publish(self):
+        # A '0.9.0.dev1' or '0.9.0rc1' left in pyproject during work in progress must
+        # not become a public release; the workflow skips loudly instead of guessing.
+        assert r"^[0-9]+\.[0-9]+\.[0-9]+$" in self._run_commands(self._doc()), (
+            "tag-and-release.yml no longer restricts publishing to plain X.Y.Z versions"
+        )
+
+    def test_both_publishers_read_the_version_identically(self):
+        # A divergence here would let this workflow cut a tag that release.yml's
+        # tag==version step rejects -- a disagreement surfacing only at publish time.
+        import yaml
+
+        with open(TestReleaseWorkflow.WORKFLOW) as f:
+            manual = yaml.safe_load(f)
+        manual_cmds = "\n".join(
+            s["run"]
+            for job in manual["jobs"].values()
+            for s in job.get("steps", [])
+            if "run" in s
+        )
+        assert self.VERSION_PARSE in self._run_commands(self._doc())
+        assert self.VERSION_PARSE in manual_cmds
+
+    def test_token_can_write_releases_but_no_more(self):
+        assert self._doc().get("permissions") == {"contents": "write"}
+
+    def test_publish_group_is_claimed_per_job_not_per_run(self):
+        # Same literal as release.yml -- groups are repository-wide, so this is what
+        # stops a hand-pushed tag and the automatic path publishing at once. It must sit
+        # on the JOB: a workflow-level group is claimed when the RUN starts, before the
+        # `if:` is evaluated, so skipped no-op runs would queue in it -- and GitHub
+        # cancels a previously *pending* run when a newer one queues, even under
+        # `cancel-in-progress: false`, which could silently drop a queued manual
+        # release.
+        doc = self._doc()
+        assert "concurrency" not in doc, (
+            "concurrency is declared at workflow level; skipped runs would claim it"
+        )
+        assert doc["jobs"]["release"]["concurrency"] == {
+            "group": PUBLISH_GROUP,
+            "cancel-in-progress": False,
+        }
+
+    def test_dispatch_path_is_ci_gated_too(self):
+        # The job `if:` cannot check a CI conclusion on the dispatch path (there is no
+        # upstream run), so the invariant is re-imposed in a step that runs on BOTH
+        # paths: the tested SHA must have a successful, push-triggered CI run. Without
+        # it, dispatching while main is red -- the very situation the recovery lever
+        # exists for -- would publish from a failing commit.
+        cmds = self._run_commands(self._doc())
+        assert "actions/workflows/ci.yml/runs" in cmds, (
+            "nothing verifies the commit has a successful CI run"
+        )
+        assert "event=push" in cmds, (
+            "the CI-run lookup counts pull_request runs, whose head_sha is a PR commit"
+        )
+        assert "exit 1" in cmds, "the CI-green check never fails the job"
+
+    def test_refuses_a_tag_that_already_exists(self):
+        # `--target` is documented as "Unused if the Git tag already exists", so a tag
+        # left behind WITHOUT a release (a hand-pushed tag whose release.yml run failed)
+        # would silently anchor the release at that tag's commit instead of the tested
+        # SHA -- defeating the one guarantee --target is here to provide.
+        cmds = self._run_commands(self._doc())
+        assert "git/ref/tags/" in cmds, (
+            "nothing checks for a pre-existing tag before publishing"
+        )
+
+    def test_every_job_is_time_capped(self):
+        for name, job in self._jobs(self._doc()).items():
+            assert isinstance(job.get("timeout-minutes"), int), (
+                f"job {name} has no timeout-minutes"
             )
-            for step in job["steps"]:
-                assert step.get("continue-on-error") is not True, (
-                    f"job {name}: step {step.get('name')!r} is non-blocking"
-                )
+
+
+class TestWorkflowsAreGuarded:
+    """Reverse guard over .github/workflows/ — the same shape as TestClaudeMd's reverse
+    guard over tests/. Before it existed, `grep workflows tests/*.py` returned only
+    hardcoded per-file paths, so a BRAND-NEW workflow — including one holding
+    `contents: write` and interpolating an expression straight into a `run:` block —
+    could land with zero coverage while the whole suite stayed green. Every workflow
+    file must now be named by a guard class in this module."""
+
+    def test_every_workflow_file_has_a_guard_class(self):
+        # Resolved through the class objects, not by grepping this file for the
+        # filename: a text match is satisfied by a filename mentioned in any passing
+        # comment or docstring, which would report a genuinely unguarded workflow as
+        # covered. Comparing the two sets also catches the reverse -- a guard class left
+        # pointing at a workflow that has been renamed or deleted.
+        guarded = {cls.WORKFLOW.name for cls in _WorkflowGuard.__subclasses__()}
+        present = {path.name for path in WORKFLOW_DIR.glob("*.y*ml")}
+        assert present, f"no workflows under {WORKFLOW_DIR} — has the path moved?"
+        assert not present - guarded, (
+            f"workflows with no _WorkflowGuard subclass: {sorted(present - guarded)}"
+        )
+        assert not guarded - present, (
+            f"guard classes point at missing workflows: {sorted(guarded - present)}"
+        )
 
 
 class TestAppTestHarness:
@@ -1749,6 +2070,7 @@ class TestClaudeMd:
             ".claude/settings.json",
             ".github/workflows/ci.yml",
             ".github/workflows/release.yml",
+            ".github/workflows/tag-and-release.yml",
             ".streamlit/config.toml",
             "pyproject.toml",
             "uv.lock",
@@ -1765,6 +2087,29 @@ class TestClaudeMd:
             assert re.search(rf"(?<![\w/]){re.escape(rel)}", text), (
                 f"{rel} is no longer documented in CLAUDE.md"
             )
+
+    def test_documented_guard_classes_exist(self):
+        # CLAUDE.md and README.md now cite guard classes by name, and nothing else
+        # resolves them -- so renaming one would leave both docs pointing at a class
+        # that is gone, with the suite green. Same drift this class exists to prevent,
+        # one level up: test_documented_spine_symbols_exist covers app symbols, this
+        # covers the guards. Curated, like the spine list.
+        import sys
+
+        module = sys.modules[__name__]
+        text = self._text()
+        for name in (
+            "_WorkflowGuard",
+            "TestCiWorkflow",
+            "TestReleaseWorkflow",
+            "TestAutoReleaseWorkflow",
+            "TestWorkflowsAreGuarded",
+        ):
+            assert hasattr(module, name), (
+                f"CLAUDE.md cites {name}, which no longer exists in "
+                f"{Path(__file__).name}"
+            )
+            assert name in text, f"{name} is no longer documented in CLAUDE.md"
 
     def test_every_test_module_is_documented(self):
         # Reverse guard over the tests/ dir (small, stable): every non-dunder .py must

@@ -1,0 +1,121 @@
+name: Tag and release
+
+# The automatic half of publishing. When CI goes green on a push to main, cut the
+# release for whatever version pyproject.toml claims there -- unless it is already cut.
+# release.yml stays as the manual path for a hand-pushed tag.
+#
+# The trigger is `workflow_run` on CI rather than `push: branches: [main]` because
+# gating on CI's CONCLUSION is what makes unattended publishing safe: it buys the whole
+# four-gate suite, including the `uv sync --locked` step that goes red when a version
+# bump lands without `uv lock`. A `push:` trigger would race CI and publish in seconds.
+#
+# `workflows:` matches ci.yml's `name:` field, NOT its path -- renaming CI would
+# silently un-gate this workflow, which is why TestAutoReleaseWorkflow reads the name
+# out of ci.yml and asserts the two agree. `branches:` filters on the upstream run's
+# head branch, so a CI run for a pull request never even starts a job here.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:      # recovery lever; constrained to main, and still CI-gated below
+
+permissions:
+  contents: write         # create a tag + a Release; nothing more (CI stays read-only)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest  # no MLX here -- read a version and call gh; the arm64
+    timeout-minutes: 10     # parity CI needs doesn't apply to publishing
+    # Only a SUCCESSFUL CI run, only from a push, only on this repository's own main.
+    # `head_branch == 'main'` alone is not enough: a fork's default branch is also
+    # called main, so the head repo has to be checked too. The dispatch leg is ANDed
+    # with a main-branch check -- as a bare disjunct it would let anyone with write
+    # access publish from any branch or tag, since on `workflow_dispatch` github.sha is
+    # the tip of the DISPATCHED ref. The CI-conclusion gate it skips is re-imposed
+    # uniformly by the "Require a green CI run" step below.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    concurrency:
+      # Declared on the JOB, not the workflow: a workflow-level group is claimed when
+      # the RUN starts, before the `if:` above is evaluated, so skipped no-op runs would
+      # queue in the group -- and GitHub cancels a previously *pending* run when a newer
+      # one queues, even under `cancel-in-progress: false`. That could silently drop a
+      # queued manual release. The literal is shared with release.yml, and concurrency
+      # groups are repository-wide, so the two publishers stay mutually exclusive.
+      group: publish-release
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # On a workflow_run event the github.sha/github.ref context points at the
+          # DEFAULT BRANCH tip, not the commit CI tested, so the tested SHA has to be
+          # named explicitly. On the workflow_dispatch path there is no upstream run and
+          # github.sha is the tip of the dispatched ref -- which the job `if:` has
+          # already constrained to main.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Require a green CI run for this commit
+        # The single place the "never publish unverified code" invariant is enforced, so
+        # it holds on BOTH entry paths rather than only inside the workflow_run `if:`.
+        # `event=push` matters: CI also runs for pull_request, and a PR run's head_sha is
+        # the PR's own commit -- counting those would let a branch commit qualify.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          green="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&status=success&per_page=1" \
+            --jq '.workflow_runs | length')"
+          if [ "$green" -eq 0 ]; then
+            echo "::error::no successful push-triggered CI run for $SHA — refusing to publish"
+            exit 1
+          fi
+
+      - name: Publish the release this version has not had yet
+        # Idempotent on repository STATE -- "does a release exist for the version
+        # pyproject.toml claims?" -- rather than on a commit diff. A
+        # `git diff HEAD^ HEAD -- pyproject.toml` detector breaks on squash merges,
+        # force pushes, several commits in one push and job re-runs; a state check
+        # survives all four, so re-running this job is always a safe no-op.
+        #
+        # `gh release create --target <sha>` creates the tag AND publishes in a single
+        # API call, so there is no window where the tag exists but the release doesn't.
+        # That is also why --verify-tag is absent here (it requires a pre-existing tag)
+        # -- pinning --target to the exact tested SHA is the stronger guarantee. But
+        # `target_commitish` is documented as "Unused if the Git tag already exists", so
+        # a tag left behind WITHOUT a release would silently anchor the release at that
+        # tag's commit instead: hence the explicit pre-existing-tag refusal below.
+        #
+        # Publishing, never --draft: a draft is absent from the public releases API, so
+        # README's shields.io release badge would freeze on the previous version, and a
+        # draft does not materialise the git tag until someone clicks Publish.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          version="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          # Strict X.Y.Z. A '0.9.0.dev1'/'0.9.0rc1' left in pyproject during work in
+          # progress must not become a public release. The skip is a green no-op: the
+          # ::notice:: in this job's log is the only signal it happened.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::pyproject version '$version' is not a plain X.Y.Z — skipping"
+            exit 0
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag is already released — nothing to do"
+            exit 0
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists as a tag but has no release; --target is ignored for an existing tag, so publishing here could describe untested code. Re-run release.yml against $tag instead."
+            exit 1
+          fi
+          echo "Cutting $tag at $SHA"
+          gh release create "$tag" --target "$SHA" --title "$tag" --generate-notes
