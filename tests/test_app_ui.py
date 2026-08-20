@@ -539,6 +539,10 @@ def test_cxr_localization_caption_discloses_override(app, png_bytes):
     app.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
     app.toggle(key="cxr_localize").set_value(True).run()
     assert any("ignored in this mode" in c.value for c in app.caption)
+    # Pin the direction word too: "Model settings" renders *below* this caption, so
+    # a substring check on "ignored in this mode" alone would not notice the caption
+    # pointing the wrong way after a reorder.
+    assert any("instruction below is ignored" in c.value for c in app.caption)
 
 
 def test_cxr_second_uploader_appears_after_first_image(app, png_bytes):

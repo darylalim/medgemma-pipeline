@@ -945,13 +945,6 @@ def render_cxr_tab(model, processor, config):
     has_image = len(images) >= 1
     is_comparing = len(images) == 2
 
-    default_instruction = (
-        DEFAULT_INSTRUCTION_COMPARE if is_comparing else DEFAULT_INSTRUCTION_IMAGE
-    )
-    instruction, is_thinking = tab_settings(
-        "cxr", default_instruction, auto_switch=True
-    )
-
     is_localizing = st.toggle(
         "Locate anatomy (bounding boxes)",
         disabled=len(images) != 1,
@@ -961,13 +954,24 @@ def render_cxr_tab(model, processor, config):
     if is_localizing and len(images) == 1:
         st.caption(
             ":material/info: Localization uses a built-in prompt; the System "
-            "instruction above is ignored in this mode."
+            "instruction below is ignored in this mode."
         )
     elif is_comparing:
         st.caption(
             ":material/info: Comparison mode: both images are sent to the model "
             "together."
         )
+
+    # Rendered last, immediately above Run, the way the other three tabs do it: the
+    # collapsed persona box is advanced and rarely edited, so it should not sit in
+    # the middle of the tab's primary controls. (auto_switch still tracks the
+    # comparison persona -- the widget is created on every run either way.)
+    default_instruction = (
+        DEFAULT_INSTRUCTION_COMPARE if is_comparing else DEFAULT_INSTRUCTION_IMAGE
+    )
+    instruction, is_thinking = tab_settings(
+        "cxr", default_instruction, auto_switch=True
+    )
 
     # Signature of the inputs this result depends on: a stale result is dropped
     # (not rendered) once the prompt, either upload, the localize mode, or the system
