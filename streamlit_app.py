@@ -3,9 +3,9 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import numpy as np
 import openslide
@@ -585,6 +585,49 @@ def load_wsi_patches(
         os.unlink(path)
 
 
+# Streamlit's default UploadedFile hasher is name + tell() + getvalue(): it walks the
+# entire payload on every Run, and it mixes in the stream position -- which both
+# loaders leave at EOF -- so under the default the CT key would differ every Run and
+# never hit. ``file_id`` is stable for the life of an upload and is what
+# ``UploadedFile.__hash__`` itself uses.
+_UPLOAD_HASH: dict[str | type[Any], Callable[[Any], Any]] = {
+    "streamlit.runtime.uploaded_file_manager.UploadedFile": lambda f: f.file_id
+}
+
+
+@st.cache_data(max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH)
+def cached_ct_volume(
+    dicom_files: Iterable[BinaryIO], max_slices: int
+) -> list[np.ndarray]:
+    """Cached wrapper over ``load_ct_volume`` (see the note on ``_UPLOAD_HASH``).
+
+    Iterating on the prompt or the persona against a fixed series is the tab's
+    central workflow, and without this every Run re-reads every DICOM. The wrapper is
+    deliberately *separate* from the pure loader: decorating ``load_ct_volume``
+    itself would turn ``TestLoadCtVolume``'s rewind guard into a cache hit and stop
+    it testing the rewind. ``max_entries=3`` leaves room to A/B a couple of slice
+    counts and still hit; the cache trades memory for that, so it is bounded on
+    purpose -- at the RAM-gated default of 20 slices an entry is ~40 MB of HU
+    arrays, and ``ram_aware_slice_cap`` only lets the count grow on machines with
+    the memory to absorb it.
+    """
+    return load_ct_volume(dicom_files, max_slices)
+
+
+@st.cache_data(max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH)
+def cached_wsi_patches(
+    uploaded_file, target_mag: float, max_patches: int
+) -> tuple[list[Image.Image], Image.Image, float]:
+    """Cached wrapper over ``load_wsi_patches`` -- the same bargain as
+    ``cached_ct_volume``, and worth more here: a miss re-spills a multi-GB slide to a
+    temp file, re-opens it in OpenSlide, then re-thumbnails, re-masks and re-reads
+    every 896px patch. Kept separate from the pure loader for the same reason (see
+    ``TestLoadWsiPatches``'s rewind guard). Costs more memory than the CT cache --
+    an 896px RGB patch is ~2.4 MB, so an entry at the 20-patch default is ~48 MB --
+    which is the bargain: RAM for not re-reading a multi-GB slide on every Run."""
+    return load_wsi_patches(uploaded_file, target_mag, max_patches)
+
+
 def show_response(response: str) -> None:
     st.divider()
     st.markdown("### Response")
@@ -1067,7 +1110,7 @@ def render_ct_tab(model, processor, config):
         with st.status("Preparing CT series…", expanded=False) as status:
             status.update(label="Reading DICOM series…")
             try:
-                hu_slices = load_ct_volume(dicom_files, n_slices)
+                hu_slices = cached_ct_volume(dicom_files, n_slices)
             except Exception as e:
                 st.error(f"Failed to read DICOM series: {e}", icon=":material/error:")
                 hu_slices = None
@@ -1190,7 +1233,7 @@ def render_wsi_tab(model, processor, config):
         with st.status("Preparing slide…", expanded=False) as status:
             status.update(label="Reading slide and sampling tissue…")
             try:
-                patches, overlay, actual_mag = load_wsi_patches(
+                patches, overlay, actual_mag = cached_wsi_patches(
                     slide_file, target_mag, n_patches
                 )
             except Exception as e:
