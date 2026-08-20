@@ -502,6 +502,22 @@ def test_ask_stale_result_cleared_when_prompt_changes(patched_mlx):
     assert any("Inputs changed" in i.value for i in at.info)
 
 
+def test_ask_result_goes_stale_when_instruction_changes(patched_mlx):
+    # The system instruction is fed to the model as the system message, so it is a
+    # run-defining input: editing the persona must strand the old answer behind the
+    # hint exactly as editing the prompt does. (Before the sig carried it, the answer
+    # re-rendered as current under a persona that never produced it.)
+    at = _app_test().run()
+    at.text_input(key="ask_prompt").set_value("What is a fracture?").run()
+    at.button(key="ask_run").click().run()
+    assert "No acute findings." in [m.value for m in at.markdown]
+    at.text_area(key="ask_instruction").set_value("You are a pediatric radiologist.")
+    at.run()  # persona edited, no re-click
+    assert not at.exception
+    assert "No acute findings." not in [m.value for m in at.markdown]
+    assert any("Inputs changed" in i.value for i in at.info)
+
+
 # --------------------------------------------------------------------------- #
 # Chest X-ray tab (single image / comparison / localization)
 # --------------------------------------------------------------------------- #

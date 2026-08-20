@@ -797,6 +797,11 @@ def render_ask_tab(model, processor, config):
     ).strip()
     instruction, is_thinking = tab_settings("ask", DEFAULT_INSTRUCTION_TEXT)
 
+    # Drop a persisted answer once the question or the system instruction changes:
+    # the persona is fed to the model as the system message, so it is as much a
+    # run-defining input as the prompt itself.
+    ask_sig = (prompt, instruction)
+
     if run_requested(
         st.button("Run", type="primary", width="stretch", key="ask_run"), prompt
     ):
@@ -808,7 +813,7 @@ def render_ask_tab(model, processor, config):
         # Persist the run so it survives later reruns: editing any widget reruns the
         # script and the Run button returns False, which would otherwise wipe the
         # answer. The render below reads from session_state on every rerun; the stored
-        # ``sig`` (the prompt) lets it drop the result once the question changes. On
+        # ``sig`` (prompt + persona) lets it drop the result once either changes. On
         # success, st.rerun() so the just-streamed raw text is discarded and only the
         # clean persisted render shows (no duplicate). On failure the error stays put.
         if raw is None:
@@ -817,11 +822,11 @@ def render_ask_tab(model, processor, config):
             st.session_state["ask_result"] = {
                 "raw": raw,
                 "is_thinking": is_thinking,
-                "sig": prompt,
+                "sig": ask_sig,
             }
             st.rerun()
 
-    result = fresh_result_or_hint("ask_result", prompt)
+    result = fresh_result_or_hint("ask_result", ask_sig)
     if result is not None:
         show_response(render_thought(result["raw"], result["is_thinking"]))
 
@@ -894,8 +899,17 @@ def render_cxr_tab(model, processor, config):
         )
 
     # Signature of the inputs this result depends on: a stale result is dropped
-    # (not rendered) once the prompt, either upload, or the localize mode changes.
-    cxr_sig = (prompt, is_localizing, _file_sig(upload1), _file_sig(upload2))
+    # (not rendered) once the prompt, either upload, the localize mode, or the system
+    # instruction changes.
+    cxr_sig = (
+        prompt,
+        is_localizing,
+        _file_sig(upload1),
+        _file_sig(upload2),
+        # Localization runs a built-in prompt and ignores the editable persona (the
+        # caption above says so), so editing it must not strand that result.
+        None if (is_localizing and len(images) == 1) else instruction,
+    )
 
     if run_requested(
         st.button("Run", type="primary", width="stretch", key="cxr_run"), prompt
@@ -1024,8 +1038,14 @@ def render_ct_tab(model, processor, config):
 
     instruction, is_thinking = tab_settings("ct", DEFAULT_INSTRUCTION_CT)
 
-    # Drop a persisted result once the prompt, uploaded slices, or slice count change.
-    ct_sig = (prompt, tuple(_file_sig(f) for f in dicom_files or []), n_slices)
+    # Drop a persisted result once the prompt, uploaded slices, slice count, or
+    # system instruction change.
+    ct_sig = (
+        prompt,
+        tuple(_file_sig(f) for f in dicom_files or []),
+        n_slices,
+        instruction,
+    )
 
     if run_requested(
         st.button(
@@ -1143,9 +1163,9 @@ def render_wsi_tab(model, processor, config):
 
     instruction, is_thinking = tab_settings("wsi", DEFAULT_INSTRUCTION_WSI)
 
-    # Drop a persisted result once the prompt, slide, magnification, or patch count
-    # change.
-    wsi_sig = (prompt, _file_sig(slide_file), target_mag, n_patches)
+    # Drop a persisted result once the prompt, slide, magnification, patch count, or
+    # system instruction change.
+    wsi_sig = (prompt, _file_sig(slide_file), target_mag, n_patches, instruction)
 
     if run_requested(
         st.button(
