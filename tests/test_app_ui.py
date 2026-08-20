@@ -314,8 +314,12 @@ def test_ask_thinking_defaults_off(app):
     assert app.toggle(key="ask_thinking").value is False
 
 
-def test_ask_run_disabled_without_prompt(app):
-    assert app.button(key="ask_run").disabled is True
+def test_ask_run_stays_enabled_without_prompt(app):
+    # Deliberately NOT disabled=not prompt. A disabled button dispatches no click
+    # event, so with an uncommitted text_input the user's first click is spent
+    # blurring the field and the app appears to do nothing. run_requested() validates
+    # the prompt at click time instead; this pins the button staying live.
+    assert app.button(key="ask_run").disabled is False
 
 
 def test_ask_run_enabled_with_prompt(app):
@@ -323,9 +327,19 @@ def test_ask_run_enabled_with_prompt(app):
     assert app.button(key="ask_run").disabled is False
 
 
-def test_ask_whitespace_prompt_keeps_run_disabled(app):
+def test_ask_empty_prompt_click_warns_instead_of_running(app):
+    app.button(key="ask_run").click().run()
+    assert not app.exception
+    assert any("Enter a question first." in w.value for w in app.warning)
+    assert "### Response" not in [m.value for m in app.markdown]
+
+
+def test_ask_whitespace_prompt_click_warns_instead_of_running(app):
     app.text_input(key="ask_prompt").set_value("   ").run()
-    assert app.button(key="ask_run").disabled is True
+    app.button(key="ask_run").click().run()
+    assert not app.exception
+    assert any("Enter a question first." in w.value for w in app.warning)
+    assert "### Response" not in [m.value for m in app.markdown]
 
 
 def test_ask_response_renders(app):

@@ -762,6 +762,31 @@ def fresh_result_or_hint(key: str, live_sig) -> dict | None:
     return result
 
 
+def run_requested(clicked: bool, prompt: str) -> bool:
+    """True when Run was clicked *and* a question has been entered.
+
+    The Run buttons are deliberately not gated on ``prompt`` via ``disabled=``. An
+    st.text_input commits its value to session state on blur or Enter only, so while
+    the typed text is still uncommitted the button renders disabled -- and a disabled
+    button dispatches no click event. The user's first click is spent blurring the
+    input (which commits the text and enables the button) and the app appears to do
+    nothing; only the second click runs. That is guaranteed whenever typing the
+    prompt is the last action before clicking Run, i.e. on every tab's first use.
+
+    Keeping the button live lets the text change and the click arrive in the same
+    rerun. Gates on *uploads* stay on ``disabled=`` -- a file_uploader commits
+    eagerly, so those never hit this trap. Callers must wrap the button call rather
+    than returning early on an empty prompt, so the staleness render below still runs
+    and a persisted result does not blink out.
+    """
+    if not clicked:
+        return False
+    if not prompt:
+        st.warning("Enter a question first.", icon=":material/edit_note:")
+        return False
+    return True
+
+
 @st.fragment
 def render_ask_tab(model, processor, config):
     st.caption("Ask a medical question. No image required.")
@@ -772,8 +797,8 @@ def render_ask_tab(model, processor, config):
     ).strip()
     instruction, is_thinking = tab_settings("ask", DEFAULT_INSTRUCTION_TEXT)
 
-    if st.button(
-        "Run", type="primary", disabled=not prompt, width="stretch", key="ask_run"
+    if run_requested(
+        st.button("Run", type="primary", width="stretch", key="ask_run"), prompt
     ):
         full_instruction, max_new_tokens = get_generation_params(
             has_image=False, is_thinking=is_thinking, system_instruction=instruction
@@ -872,8 +897,8 @@ def render_cxr_tab(model, processor, config):
     # (not rendered) once the prompt, either upload, or the localize mode changes.
     cxr_sig = (prompt, is_localizing, _file_sig(upload1), _file_sig(upload2))
 
-    if st.button(
-        "Run", type="primary", disabled=not prompt, width="stretch", key="cxr_run"
+    if run_requested(
+        st.button("Run", type="primary", width="stretch", key="cxr_run"), prompt
     ):
         # Localization is single-image only; with two images it is unavailable.
         localize = is_localizing and len(images) == 1
@@ -1002,12 +1027,15 @@ def render_ct_tab(model, processor, config):
     # Drop a persisted result once the prompt, uploaded slices, or slice count change.
     ct_sig = (prompt, tuple(_file_sig(f) for f in dicom_files or []), n_slices)
 
-    if st.button(
-        "Run",
-        type="primary",
-        disabled=not (prompt and dicom_files),
-        width="stretch",
-        key="ct_run",
+    if run_requested(
+        st.button(
+            "Run",
+            type="primary",
+            disabled=not dicom_files,
+            width="stretch",
+            key="ct_run",
+        ),
+        prompt,
     ):
         # Clear any prior run, then do the heavy work inside the button block;
         # persist the result so it survives later reruns (see render_ask_tab). An
@@ -1119,12 +1147,15 @@ def render_wsi_tab(model, processor, config):
     # change.
     wsi_sig = (prompt, _file_sig(slide_file), target_mag, n_patches)
 
-    if st.button(
-        "Run",
-        type="primary",
-        disabled=not (prompt and slide_file),
-        width="stretch",
-        key="wsi_run",
+    if run_requested(
+        st.button(
+            "Run",
+            type="primary",
+            disabled=not slide_file,
+            width="stretch",
+            key="wsi_run",
+        ),
+        prompt,
     ):
         # Clear any prior run, then do the heavy work inside the button block;
         # persist the result so it survives later reruns (see render_ask_tab). An
