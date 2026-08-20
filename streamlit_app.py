@@ -71,6 +71,7 @@ DEFAULT_INSTRUCTION_CT = (
 # channel is a distinct Hounsfield-unit window (wide / soft-tissue / brain). These
 # ranges are part of the model's trained input format, so they are fixed.
 CT_WINDOWS: list[tuple[int, int]] = [(-1024, 1024), (-135, 215), (0, 80)]
+CT_THUMBNAIL_SIZE = (256, 256)  # bounding box for the "view all slices" gallery
 
 WSI_TYPES = ["svs", "ndpi", "tif", "tiff"]
 WSI_PATCH_SIZE = 896  # MedGemma's native image size
@@ -357,6 +358,23 @@ def _cached_total_ram_gib() -> float:
     ``sysctl``. Kept separate from ``_detect_total_ram_gib`` so that helper stays
     uncached and directly unit-testable."""
     return _detect_total_ram_gib()
+
+
+def ct_thumbnails(slices: Sequence[Image.Image]) -> list[Image.Image]:
+    """Downscaled copies of the windowed slices, for the "view all" gallery.
+
+    These are persisted in ``st.session_state``, so size is the whole point: at
+    ``ram_aware_slice_cap``'s 64-slice hard cap the full-resolution slices would be
+    well over 100 MB per session, while a 256px thumbnail is ~0.2 MB. ``thumbnail``
+    mutates in place and preserves aspect ratio, so copy before scaling -- the
+    originals are what get sent to the model.
+    """
+    thumbs = []
+    for image in slices:
+        thumb = image.copy()
+        thumb.thumbnail(CT_THUMBNAIL_SIZE)
+        thumbs.append(thumb)
+    return thumbs
 
 
 def ram_aware_slice_cap(total_ram_gib: float | None = None) -> tuple[int, int]:
@@ -1182,6 +1200,8 @@ def render_ct_tab(model, processor, config):
             if raw is not None:
                 st.session_state["ct_result"] = {
                     "preview": slice_images[0],
+                    "thumbs": ct_thumbnails(slice_images),
+                    "labels": labels,
                     "count": len(slice_images),
                     "raw": raw,
                     "is_thinking": is_thinking,
@@ -1199,6 +1219,14 @@ def render_ct_tab(model, processor, config):
         caption=f"Sample windowed slice (1 of {result['count']})",
         width="stretch",
     )
+    # The model numbers its findings by slice, so give the reader a way to actually
+    # look at the slice a finding names -- the single preview above left "slice 7"
+    # unauditable. Collapsed by default: this is for checking a claim, not browsing.
+    # (WSI needs no equivalent; its overlay already outlines every sampled patch.)
+    thumbs = result.get("thumbs")
+    if thumbs:
+        with st.expander(f"View all {result['count']} windowed slices", type="compact"):
+            st.image(thumbs, caption=result["labels"], width=180)
     show_response(render_thought(result["raw"], result["is_thinking"]))
 
 

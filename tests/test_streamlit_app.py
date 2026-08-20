@@ -17,11 +17,13 @@ import pytest
 from PIL import Image
 
 from streamlit_app import (
+    CT_THUMBNAIL_SIZE,
     LOCALIZATION_INSTRUCTION,
     _detect_total_ram_gib,
     _read_patch,
     _slide_objective_power,
     build_messages,
+    ct_thumbnails,
     draw_boxes,
     effective_magnification,
     get_generation_params,
@@ -445,6 +447,31 @@ class TestWindowCtSlice:
             np.full((2, 2), 50.0), windows=[(0, 100), (0, 100), (0, 100)]
         )
         assert img.getpixel((0, 0)) == (128, 128, 128)
+
+
+class TestCtThumbnails:
+    def test_clamps_to_the_bounding_box_and_keeps_aspect(self):
+        (thumb,) = ct_thumbnails([Image.new("RGB", (1024, 512))])
+        assert thumb.size == (256, 128)
+        assert max(thumb.size) <= max(CT_THUMBNAIL_SIZE)
+
+    def test_leaves_the_originals_untouched(self):
+        # thumbnail() scales in place, and the originals are what reach the model.
+        original = Image.new("RGB", (600, 600))
+        ct_thumbnails([original])
+        assert original.size == (600, 600)
+
+    def test_preserves_count_and_order(self):
+        slices = [Image.new("RGB", (400, 100 * (i + 1))) for i in range(3)]
+        assert [t.size for t in ct_thumbnails(slices)] == [
+            (256, 64),
+            (256, 128),
+            (256, 192),
+        ]
+
+    def test_does_not_upscale_a_small_slice(self):
+        (thumb,) = ct_thumbnails([Image.new("RGB", (100, 80))])
+        assert thumb.size == (100, 80)
 
 
 class TestSubsampleIndices:

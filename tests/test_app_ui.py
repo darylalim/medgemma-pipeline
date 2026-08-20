@@ -1211,6 +1211,21 @@ def test_ct_result_persists_across_rerun(patched_mlx, monkeypatch):
     assert len(calls) == 1  # served from session_state, not recomputed
 
 
+def test_ct_gallery_exposes_every_windowed_slice(patched_mlx, monkeypatch):
+    # The model numbers its findings by slice, so each windowed slice has to be
+    # reachable -- the single preview above the gallery only ever shows slice 1.
+    _force_ram_gib(monkeypatch, 32)
+    out = MagicMock()
+    out.text = "Two contiguous slices of the liver."
+    _patch_stream(monkeypatch, lambda *a, **k: out)
+    at = _app_test().run()
+    at.text_input(key="ct_prompt").set_value("Any lesions?").run()
+    _upload_ct_pair(at)
+    at.button(key="ct_run").click().run()
+    assert not at.exception
+    assert any("View all 2 windowed slices" in e.label for e in at.expander)
+
+
 def test_ct_stale_result_cleared_when_slice_count_changes(patched_mlx, monkeypatch):
     _force_ram_gib(monkeypatch, 32)  # slider default 10, max 20
     out = MagicMock()
