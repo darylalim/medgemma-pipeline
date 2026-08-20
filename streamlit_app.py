@@ -1317,8 +1317,23 @@ def render_ct_tab(model, processor, config):
     # (WSI needs no equivalent; its overlay already outlines every sampled patch.)
     thumbs = result.get("thumbs")
     if thumbs:
-        with st.expander(f"View all {result['count']} windowed slices", type="compact"):
-            st.image(thumbs, caption=result["labels"], width=180)
+        # An expander body is computed and shipped to the frontend even while
+        # collapsed (Streamlit documents this), and st.image re-encodes every
+        # thumbnail to PNG -- work paid on every fragment rerun of a panel most
+        # sessions never open, and it scales with ram_aware_slice_cap's 64-slice
+        # ceiling. on_change="rerun" + .open defers it to the click. The key is what
+        # makes .open readable at all, and it doubles as the handle a test needs:
+        # under AppTest the expander starts closed, so without it the body would be
+        # unreachable and the gallery untestable.
+        gallery = st.expander(
+            f"View all {result['count']} windowed slices",
+            type="compact",
+            on_change="rerun",
+            key="ct_gallery",
+        )
+        if gallery.open:
+            with gallery:
+                st.image(thumbs, caption=result["labels"], width=180)
     show_response(render_thought(result["raw"], result["is_thinking"]))
 
 

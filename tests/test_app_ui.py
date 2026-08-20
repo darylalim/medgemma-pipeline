@@ -1262,6 +1262,9 @@ def test_ct_result_persists_across_rerun(patched_mlx, monkeypatch):
 def test_ct_gallery_exposes_every_windowed_slice(patched_mlx, monkeypatch):
     # The model numbers its findings by slice, so each windowed slice has to be
     # reachable -- the single preview above the gallery only ever shows slice 1.
+    # The gallery renders lazily (on_change="rerun" + .open), so the label alone no
+    # longer proves the slices are there: drive the expander open through its key,
+    # which is what that key is for, and assert the slices themselves.
     _force_ram_gib(monkeypatch, 32)
     out = MagicMock()
     out.text = "Two contiguous slices of the liver."
@@ -1272,6 +1275,12 @@ def test_ct_gallery_exposes_every_windowed_slice(patched_mlx, monkeypatch):
     at.button(key="ct_run").click().run()
     assert not at.exception
     assert any("View all 2 windowed slices" in e.label for e in at.expander)
+    captions = [i.captions for i in at.image]
+    assert ["SLICE 1", "SLICE 2"] not in captions  # collapsed: body not computed
+    at.session_state["ct_gallery"] = True
+    at.run()
+    assert not at.exception
+    assert ["SLICE 1", "SLICE 2"] in [i.captions for i in at.image]  # opened
 
 
 def test_ct_volume_cache_hits_on_a_second_run(patched_mlx, monkeypatch):
