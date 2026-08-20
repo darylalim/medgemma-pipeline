@@ -823,11 +823,24 @@ def tab_settings(
 
 
 def _file_sig(uploaded) -> tuple:
-    """Identity of an uploaded file (name + size) for staleness checks; () when no
-    file. A persisted result stores the signature of the inputs that produced it,
-    so the render block drops it once the upload (or any tracked input) changes."""
+    """Identity of an uploaded file for staleness checks; () when no file.
+
+    Keys on ``file_id`` -- the same identity ``_UPLOAD_HASH`` hands the caches, and
+    what ``UploadedFile.__hash__`` itself uses. Name + size collides on exactly the
+    input this app sees most: per-slice DICOMs off one scanner share a name pattern
+    (``IM_0001``) and, at a fixed protocol, a byte size, so two different studies
+    could compare equal and ``fresh_result_or_hint`` would serve the previous
+    patient's result as fresh, with no "Inputs changed" hint. Falls back to name +
+    size for anything without a ``file_id`` (a plain BytesIO in a unit test).
+
+    A persisted result stores the signature of the inputs that produced it, so the
+    render block drops it once the upload (or any tracked input) changes.
+    """
     if uploaded is None:
         return ()
+    file_id = getattr(uploaded, "file_id", None)
+    if file_id is not None:
+        return (file_id,)
     return (getattr(uploaded, "name", ""), getattr(uploaded, "size", 0))
 
 
