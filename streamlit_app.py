@@ -321,6 +321,15 @@ def load_ct_volume(
                 "Unsupported DICOM: expected single-frame grayscale CT slices "
                 "(got a multi-frame or color image)."
             )
+        # apply_rescale hands back float64 (apply_modality_lut casts before applying
+        # the slope), doubling what cached_ct_volume holds -- ~42 MB per entry at the
+        # 20-slice default -- for precision nothing downstream uses: normalize_hu's
+        # first move is .astype(np.float32). Guarded rather than unconditional,
+        # because with a Modality LUT Sequence (0028,3000), or with no rescale tags at
+        # all, apply_rescale returns the uint8/uint16 array unchanged, where a blind
+        # cast would *double* the footprint instead of halving it.
+        if hu.dtype == np.float64:
+            hu = hu.astype(np.float32)
         slices.append(hu)
     return slices
 
