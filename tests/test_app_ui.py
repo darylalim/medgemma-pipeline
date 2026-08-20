@@ -388,6 +388,32 @@ def test_ask_empty_generation_renders_without_crashing(patched_mlx, monkeypatch)
     assert not at.error  # empty output is benign, not an error
 
 
+def test_truncated_generation_warns_that_output_is_incomplete(patched_mlx):
+    # A run cut off at max_new_tokens renders byte-identically to one that finished
+    # -- the answer just stops -- so stream_generate's finish_reason on the final
+    # chunk is the only thing that can tell the reader. Without this the clipped
+    # report reads as a complete one.
+    patched_mlx.text = "The lungs are clear and the cardiomediastinal"
+    patched_mlx.finish_reason = "length"
+    at = _app_test().run()
+    at.text_input(key="ask_prompt").set_value("Describe the film.").run()
+    at.button(key="ask_run").click().run()
+    assert not at.exception
+    assert any("token limit" in w.value for w in at.warning)
+
+
+def test_completed_generation_does_not_warn_about_truncation(patched_mlx):
+    # The other half: only "length" warns. A run that stopped on EOS is complete,
+    # and a warning on every answer would train the reader to ignore it.
+    patched_mlx.text = "No acute findings."
+    patched_mlx.finish_reason = "stop"
+    at = _app_test().run()
+    at.text_input(key="ask_prompt").set_value("Describe the film.").run()
+    at.button(key="ask_run").click().run()
+    assert not at.exception
+    assert not any("token limit" in w.value for w in at.warning)
+
+
 def test_ask_thinking_trace_renders(patched_mlx):
     patched_mlx.text = "<unused94>thought\nLet me reason.<unused95>Final answer."
     at = _app_test().run()
@@ -667,6 +693,27 @@ def test_cxr_localization_passes_square_image_to_model(patched_mlx, monkeypatch)
     # asserts the penalty is passed, so this stays a deliberate exception.
     assert "repetition_penalty" not in captured["gen_kwargs"]
     assert "repetition_context_size" not in captured["gen_kwargs"]
+
+
+def test_cxr_localization_warns_when_the_box_list_is_truncated(patched_mlx, png_bytes):
+    # Pins the placement, not just the flag: the localize branch renders boxes and a
+    # label legend but never reaches show_response, so a truncation warning attached
+    # to the answer view would be invisible on exactly the path where a JSON list
+    # clipped at the cap silently costs structures. Hence above the mode branch.
+    patched_mlx.text = (
+        '```json\n[{"box_2d": [100, 100, 500, 500], "label": "right clavicle"}]\n```'
+    )
+    patched_mlx.finish_reason = "length"
+    at = _app_test().run()
+    at.text_input(key="cxr_prompt").set_value("Locate everything").run()
+    at.file_uploader(key="cxr_image1").upload("xray.png", png_bytes, "image/png").run()
+    at.toggle(key="cxr_localize").set_value(True).run()
+    at.button(key="cxr_run").click().run()
+    assert not at.exception
+    markdowns = [m.value for m in at.markdown]
+    assert "### Detected structures" in markdowns  # the localize view, not the answer
+    assert "### Response" not in markdowns
+    assert any("token limit" in w.value for w in at.warning)
 
 
 def test_cxr_localization_no_boxes_warns(patched_mlx, png_bytes):

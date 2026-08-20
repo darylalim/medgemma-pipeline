@@ -660,6 +660,27 @@ def show_response(response: str) -> None:
     st.markdown(response)
 
 
+def warn_if_truncated(result: dict) -> None:
+    """Flag a persisted result whose generation hit the token cap.
+
+    A run cut off at ``max_new_tokens`` renders byte-identically to one that
+    finished -- the answer simply stops, mid-sentence or mid-word -- so without this
+    the reader has no way to tell a complete report from a clipped one. Truncation is
+    routine here rather than exotic: a plain "Describe this chest X-ray" does not fit
+    the 300-token budget, and the CT/WSI reads regularly reach 2000.
+
+    Rendered above the result rather than beside the answer, because it qualifies
+    everything below it -- including the localization path, which draws boxes and a
+    label legend but never calls ``show_response``, and where a JSON list clipped
+    at the cap silently costs structures.
+    """
+    if result.get("truncated"):
+        st.warning(
+            "Output stopped at the token limit and may be incomplete.",
+            icon=":material/content_cut:",
+        )
+
+
 def load_uploaded_image(uploaded_file) -> Image.Image | None:
     """Open an uploaded file as an image (loading is decoupled from previewing so
     the CXR tab can lay two studies out side by side in comparison mode).
@@ -690,7 +711,14 @@ st.set_page_config(
 
 
 def run_model(
-    model, processor, config, messages, images, max_new_tokens, penalize_repetition=True
+    model,
+    processor,
+    config,
+    messages,
+    images,
+    max_new_tokens,
+    penalize_repetition=True,
+    finish: dict | None = None,
 ):
     """Stream generation live and return the full accumulated response text.
 
@@ -705,6 +733,14 @@ def run_model(
     over ``stream_generate``, so the returned string is identical; determinism
     (``temperature=0`` + the repetition penalties) is preserved. Returns ``None`` on
     failure after showing an error, so callers bail out.
+
+    ``finish`` is an optional out-parameter: pass a dict and it comes back carrying
+    ``{"reason": <finish_reason of the last chunk>}``. It is an out-param rather than
+    part of the return value because all four call sites gate on ``if raw is None``,
+    and widening the ``str | None`` contract to a tuple would churn every one of them
+    plus the tests that mock this path. ``stream_generate`` reports ``finish_reason``
+    only on its final chunk (``"length"`` when the token budget ran out, ``"stop"`` on
+    EOS), so recording every chunk and letting the last write win is exactly right.
     """
     image_for_model = images or None
     num_images = len(images)
@@ -732,6 +768,13 @@ def run_model(
         else {}
     )
 
+    def _record_finish(chunk) -> None:
+        # getattr, not chunk.finish_reason: the tests hand run_model MagicMock chunks
+        # carrying only .text, and a hard attribute access there would be an
+        # AttributeError on a path the real backend always populates.
+        if finish is not None:
+            finish["reason"] = getattr(chunk, "finish_reason", None)
+
     def _deltas():
         # Prefill -- the vision-tower encode of up to 20 slices/patches, plus prompt
         # processing -- all happens before the first token, and st.write_stream
@@ -758,8 +801,10 @@ def run_model(
             return
         # stream_generate yields GenerationResult chunks; .text is the incremental
         # delta, not the running text, so write_stream concatenates them.
+        _record_finish(first)
         yield first.text
         for chunk in stream:
+            _record_finish(chunk)
             yield chunk.text
 
     try:
@@ -911,7 +956,10 @@ def render_ask_tab(model, processor, config):
             has_image=False, is_thinking=is_thinking, system_instruction=instruction
         )
         messages = build_messages(prompt, full_instruction)
-        raw = run_model(model, processor, config, messages, [], max_new_tokens)
+        finish: dict = {}
+        raw = run_model(
+            model, processor, config, messages, [], max_new_tokens, finish=finish
+        )
         # Persist the run so it survives later reruns: editing any widget reruns the
         # script and the Run button returns False, which would otherwise wipe the
         # answer. The render below reads from session_state on every rerun; the stored
@@ -924,12 +972,17 @@ def render_ask_tab(model, processor, config):
             st.session_state["ask_result"] = {
                 "raw": raw,
                 "is_thinking": is_thinking,
+                # Deliberately not part of ``sig``: truncation is an outcome of the
+                # run, not an input to it, so including it would strand the very
+                # result it describes on the next rerun.
+                "truncated": finish.get("reason") == "length",
                 "sig": ask_sig,
             }
             st.rerun()
 
     result = fresh_result_or_hint("ask_result", ask_sig)
     if result is not None:
+        warn_if_truncated(result)
         show_response(render_thought(result["raw"], result["is_thinking"]))
 
 
@@ -1045,6 +1098,7 @@ def render_cxr_tab(model, processor, config):
         messages = build_messages(
             prompt, full_instruction, model_images, image_labels=image_labels
         )
+        finish: dict = {}
         raw = run_model(
             model,
             processor,
@@ -1053,6 +1107,7 @@ def render_cxr_tab(model, processor, config):
             model_images,
             max_new_tokens,
             penalize_repetition=not localize,
+            finish=finish,
         )
         # Persist the finished run (see render_ask_tab). For localization, parse the
         # boxes and draw the annotation once here — strip any thinking trace with
@@ -1076,6 +1131,7 @@ def render_cxr_tab(model, processor, config):
                     "is_thinking": is_thinking,
                     "annotated": annotated,
                     "boxes": boxes,
+                    "truncated": finish.get("reason") == "length",
                     "sig": cxr_sig,
                 }
             else:
@@ -1083,6 +1139,7 @@ def render_cxr_tab(model, processor, config):
                     "mode": "text",
                     "raw": raw,
                     "is_thinking": is_thinking,
+                    "truncated": finish.get("reason") == "length",
                     "sig": cxr_sig,
                 }
             st.rerun()
@@ -1090,6 +1147,10 @@ def render_cxr_tab(model, processor, config):
     result = fresh_result_or_hint("cxr_result", cxr_sig)
     if result is None:
         return
+    # Ahead of the mode branch on purpose: the localization path below renders boxes
+    # and a legend but never reaches show_response, and a box list clipped at the
+    # token cap is exactly where an unflagged truncation costs the most.
+    warn_if_truncated(result)
     response = render_thought(result["raw"], result["is_thinking"])
     if result["mode"] == "localize":
         if result["annotated"] is not None:
@@ -1207,8 +1268,15 @@ def render_ct_tab(model, processor, config):
             messages = build_messages(
                 prompt, full_instruction, slice_images, image_labels=labels
             )
+            finish: dict = {}
             raw = run_model(
-                model, processor, config, messages, slice_images, max_new_tokens
+                model,
+                processor,
+                config,
+                messages,
+                slice_images,
+                max_new_tokens,
+                finish=finish,
             )
             if raw is not None:
                 st.session_state["ct_result"] = {
@@ -1218,6 +1286,7 @@ def render_ct_tab(model, processor, config):
                     "count": len(slice_images),
                     "raw": raw,
                     "is_thinking": is_thinking,
+                    "truncated": finish.get("reason") == "length",
                     "sig": ct_sig,
                 }
                 # Discard the streamed run so only the clean render (preview +
@@ -1227,6 +1296,7 @@ def render_ct_tab(model, processor, config):
     result = fresh_result_or_hint("ct_result", ct_sig)
     if result is None:
         return
+    warn_if_truncated(result)
     st.image(
         result["preview"],
         caption=f"Sample windowed slice (1 of {result['count']})",
@@ -1340,7 +1410,16 @@ def render_wsi_tab(model, processor, config):
             messages = build_messages(
                 prompt, full_instruction, patches, image_labels=labels
             )
-            raw = run_model(model, processor, config, messages, patches, max_new_tokens)
+            finish: dict = {}
+            raw = run_model(
+                model,
+                processor,
+                config,
+                messages,
+                patches,
+                max_new_tokens,
+                finish=finish,
+            )
             if raw is not None:
                 st.session_state["wsi_result"] = {
                     "overlay": overlay,
@@ -1349,6 +1428,7 @@ def render_wsi_tab(model, processor, config):
                     "preview": patches[0],
                     "raw": raw,
                     "is_thinking": is_thinking,
+                    "truncated": finish.get("reason") == "length",
                     "sig": wsi_sig,
                 }
                 # Discard the streamed run so only the clean render (overlay + sample
@@ -1358,6 +1438,7 @@ def render_wsi_tab(model, processor, config):
     result = fresh_result_or_hint("wsi_result", wsi_sig)
     if result is None:
         return
+    warn_if_truncated(result)
     st.image(result["overlay"], caption="Tissue overview", width="stretch")
     st.caption(f"{result['count']} patches sampled at ~{result['actual_mag']:.1f}x.")
     st.image(
