@@ -615,13 +615,20 @@ def load_wsi_patches(
 # entire payload on every Run, and it mixes in the stream position -- which both
 # loaders leave at EOF -- so under the default the CT key would differ every Run and
 # never hit. ``file_id`` is stable for the life of an upload and is what
-# ``UploadedFile.__hash__`` itself uses.
+# ``UploadedFile.__hash__`` itself uses -- and, via ``_file_sig``, the same identity
+# the staleness gate keys on, so the cache and the freshness check agree on what
+# "the same file" means. Both wrappers below are ``scope="session"``: a ``file_id``
+# is minted per upload per session, so an entry outliving its session can never be
+# hit again -- it is only ~40-48 MB of decoded imaging waiting on max_entries
+# eviction, in an app whose slice budget is already hand-tuned against installed RAM.
 _UPLOAD_HASH: dict[str | type[Any], Callable[[Any], Any]] = {
     "streamlit.runtime.uploaded_file_manager.UploadedFile": lambda f: f.file_id
 }
 
 
-@st.cache_data(max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH)
+@st.cache_data(
+    max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH, scope="session"
+)
 def cached_ct_volume(
     dicom_files: Iterable[BinaryIO], max_slices: int
 ) -> list[np.ndarray]:
@@ -640,7 +647,9 @@ def cached_ct_volume(
     return load_ct_volume(dicom_files, max_slices)
 
 
-@st.cache_data(max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH)
+@st.cache_data(
+    max_entries=3, show_spinner=False, hash_funcs=_UPLOAD_HASH, scope="session"
+)
 def cached_wsi_patches(
     uploaded_file, target_mag: float, max_patches: int
 ) -> tuple[list[Image.Image], Image.Image, float]:

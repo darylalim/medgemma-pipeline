@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pydicom
 import pytest
 import streamlit as st
 from PIL import Image
@@ -1271,6 +1272,41 @@ def test_ct_gallery_exposes_every_windowed_slice(patched_mlx, monkeypatch):
     at.button(key="ct_run").click().run()
     assert not at.exception
     assert any("View all 2 windowed slices" in e.label for e in at.expander)
+
+
+def test_ct_volume_cache_hits_on_a_second_run(patched_mlx, monkeypatch):
+    # cached_ct_volume is scope="session", so its entries live under the session id
+    # and are dropped when the session disconnects. If that key were unstable across
+    # reruns the cache would miss every single Run and nothing else in the suite would
+    # notice -- the app would just silently re-read every DICOM each time. Count the
+    # reads instead of trusting it. (Same reason `hash_funcs` keys on file_id: under
+    # Streamlit's default hasher the CT key mixes in a stream position both loaders
+    # leave at EOF, so it changed every Run and never hit.)
+    _force_ram_gib(monkeypatch, 32)
+    reads = []
+    real_dcmread = pydicom.dcmread
+
+    def _counting_dcmread(*a, **k):
+        reads.append(1)
+        return real_dcmread(*a, **k)
+
+    monkeypatch.setattr("pydicom.dcmread", _counting_dcmread)
+    runs = []
+    out = MagicMock()
+    out.text = "Two contiguous slices of the liver."
+    _patch_stream(monkeypatch, lambda *a, **k: runs.append(1) or out)
+    at = _app_test().run()
+    at.text_input(key="ct_prompt").set_value("Any lesions?").run()
+    _upload_ct_pair(at)
+    at.button(key="ct_run").click().run()
+    assert not at.exception
+    assert (len(runs), len(reads)) == (1, 2)  # the two uploaded slices, read once
+    at.button(key="ct_run").click().run()  # identical inputs -> served from the cache
+    assert not at.exception
+    # runs == 2 is what keeps this honest: the second click really did re-enter the
+    # Run block and re-infer, so reads staying at 2 is a cache hit rather than a
+    # button that never fired.
+    assert (len(runs), len(reads)) == (2, 2)
 
 
 def test_ct_stale_result_cleared_when_slice_count_changes(patched_mlx, monkeypatch):
