@@ -673,7 +673,6 @@ def cached_wsi_patches(
 
 
 def show_response(response: str) -> None:
-    st.divider()
     st.markdown("### Response")
     st.markdown(response)
 
@@ -844,7 +843,19 @@ def render_thought(raw_response: str, is_thinking: bool) -> str:
     """Split off any thinking trace into an expander; return the answer text."""
     thought, response = parse_response(raw_response, is_thinking)
     if thought is not None:
-        with st.expander("Thinking trace"):
+        # type="compact" is documented as "ideal for displaying AI reasoning,
+        # thoughts, or collapsible metadata without visual clutter" -- a literal
+        # description of this element. Kept default-bordered on the settings expander
+        # in tab_settings, which holds real widgets rather than read-only prose.
+        #
+        # No icon= here, or on any other expander in this app, however apt the glyph:
+        # AppTest classifies an expandable block by whether it carries an icon
+        # (element_tree.py: `if block.expandable.icon: Status(...) else Expander(...)`),
+        # so an icon moves the element out of ``at.expander`` and into ``at.status``,
+        # where ``.state`` then raises "Unknown Status state" on any glyph that isn't
+        # one of st.status's own three. That breaks both the "Thinking trace" lookups
+        # and the CT/WSI ``at.status[0].state`` error assertions.
+        with st.expander("Thinking trace", type="compact"):
             st.markdown(thought)
     return response
 
@@ -874,6 +885,8 @@ def tab_settings(
     # expander so the primary flow — prompt → upload → Run — leads each tab. The
     # widgets are still created every run, so the auto_switch persona tracking and
     # all key-based lookups are unaffected.
+    # No icon= (see render_thought): an icon reclassifies this as an st.status under
+    # AppTest and breaks the harness's status/expander discrimination.
     with st.expander("Model settings", expanded=False):
         instruction = st.text_area(
             "System instruction",
@@ -1173,7 +1186,6 @@ def render_cxr_tab(model, processor, config):
     if result["mode"] == "localize":
         if result["annotated"] is not None:
             st.image(result["annotated"], caption="Localized anatomy", width="stretch")
-            st.divider()
             st.markdown("### Detected structures")
             # The boxes are drawn on the image above, so list the labels rather
             # than the raw normalized coordinates (cryptic to a clinician). Badges
