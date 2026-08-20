@@ -715,25 +715,45 @@ def run_model(
     )
 
     def _deltas():
-        for chunk in stream_generate(
-            model,
-            processor,
-            formatted_prompt,  # ty: ignore[invalid-argument-type]
-            image_for_model,
-            max_tokens=max_new_tokens,
-            temperature=0.0,
-            **penalty_kwargs,
-        ):
-            # stream_generate yields GenerationResult chunks; .text is the incremental
-            # delta, not the running text, so write_stream concatenates them.
+        # Prefill -- the vision-tower encode of up to 20 slices/patches, plus prompt
+        # processing -- all happens before the first token, and st.write_stream
+        # creates no element until the first non-empty chunk. Without a spinner here
+        # the main area is blank through the longest silence of the run (on CT/WSI
+        # the st.status has already resolved to complete by this point, so there is
+        # nothing live on screen at all). st.spinner is a transient element, so it
+        # leaves no gap above the stream once tokens arrive, and its built-in 0.5s
+        # delay keeps it invisible on the fast text-only path.
+        stream = iter(
+            stream_generate(
+                model,
+                processor,
+                formatted_prompt,  # ty: ignore[invalid-argument-type]
+                image_for_model,
+                max_tokens=max_new_tokens,
+                temperature=0.0,
+                **penalty_kwargs,
+            )
+        )
+        with st.spinner("Analyzing…", show_time=True):
+            first = next(stream, None)
+        if first is None:
+            return
+        # stream_generate yields GenerationResult chunks; .text is the incremental
+        # delta, not the running text, so write_stream concatenates them.
+        yield first.text
+        for chunk in stream:
             yield chunk.text
 
     try:
         # write_stream renders the tokens live and returns the concatenated string.
+        # ``cursor`` marks that a slow local model is still emitting during the gaps
+        # between bursts; it is drawn only in the live container and never enters the
+        # accumulated return value, so parse_response and the stored raw text are
+        # bit-identical with or without it.
         # The streamed output (incl. thinking sentinels / raw localization JSON) is
         # replaced by the caller's clean persisted render on the st.rerun() it issues
         # after storing this return value.
-        return st.write_stream(_deltas())
+        return st.write_stream(_deltas(), cursor="▌")
     except Exception as e:
         st.error(f"Inference failed: {e}", icon=":material/error:")
         return None
