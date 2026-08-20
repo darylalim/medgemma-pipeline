@@ -60,7 +60,7 @@ The app opens with four tabs:
 - **Ask** — enter a question and run for a text-only answer.
 - **Chest X-ray** — upload an image and run for analysis. To **locate anatomy**, enable the toggle and ask e.g. *"Where is the right clavicle?"*; the app draws labeled bounding boxes (this mode uses a built-in prompt and ignores the system instruction). To **compare** two studies, upload a first image, then a second in the slot that appears — the two are previewed side by side and the app sends both in one prompt and describes the changes. (Localization is single-image only and is disabled with two images.)
 - **Computed tomography** — upload a CT series as individual DICOM slice files (multi-select; extensionless files such as `IM_0001` are accepted, since per-slice DICOMs off a PACS or study CD often have no extension), choose how many slices to analyze, enter a question, and run. Each slice is windowed into a false-color image before analysis.
-- **Pathology (WSI)** — upload a whole-slide image (`.svs`/`.ndpi`/`.tif`/`.tiff`), pick a magnification (5/10/20/40×) and how many tissue patches to analyze, enter a question, and run. A tissue-overview overlay (sampled patches outlined) and a sample patch are shown, with the actual magnification disclosed (clamped to the slide's available pyramid levels).
+- **Pathology (WSI)** — upload a whole-slide image (`.svs`/`.ndpi`/`.tif`/`.tiff`, up to 2 GB), pick a magnification (5/10/20/40×) and how many tissue patches to analyze, enter a question, and run. A tissue-overview overlay (sampled patches outlined) and a sample patch are shown, with the actual magnification disclosed (clamped to the slide's available pyramid levels).
 
 ## Try it with sample data
 

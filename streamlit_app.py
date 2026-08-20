@@ -34,6 +34,14 @@ FAVICON_PATH = Path(__file__).resolve().parent / "assets" / "favicon.png"
 
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 
+# .streamlit/config.toml raises server.maxUploadSize to 2000 MB so real whole-slide
+# images get through (Streamlit's 200 MB default rejects them at the HTTP layer). That
+# ceiling is global, so every uploader that is NOT the slide one narrows itself back to
+# the stock 200 MB. It matters most on the CT uploader: that one is
+# accept_multiple_files=True, carries no type= filter by design, and reads every slice
+# fully into memory, so it has the widest blast radius of the four.
+NON_WSI_MAX_UPLOAD_MB = 200
+
 # Greedy decoding (temperature 0) can fall into degenerate repetition loops on
 # longer generations (e.g. a multi-slice CT read). A repetition penalty over a wide
 # context breaks them while staying deterministic. Re-verified on the 8-bit weights:
@@ -1029,8 +1037,14 @@ def render_cxr_tab(model, processor, config):
         key="cxr_prompt",
     ).strip()
 
+    # max_upload_size pins these back to Streamlit's stock 200 MB: the global ceiling
+    # in .streamlit/config.toml is raised to 2000 for whole-slide images, and a
+    # radiograph has no business anywhere near that.
     upload1 = st.file_uploader(
-        "Upload a chest X-ray", type=IMAGE_TYPES, key="cxr_image1"
+        "Upload a chest X-ray",
+        type=IMAGE_TYPES,
+        max_upload_size=NON_WSI_MAX_UPLOAD_MB,
+        key="cxr_image1",
     )
     image1 = load_uploaded_image(upload1)
     # A second slot appears only once the first image exists, so the model can
@@ -1041,6 +1055,7 @@ def render_cxr_tab(model, processor, config):
         upload2 = st.file_uploader(
             "Upload a second image to compare (optional)",
             type=IMAGE_TYPES,
+            max_upload_size=NON_WSI_MAX_UPLOAD_MB,
             key="cxr_image2",
         )
         image2 = load_uploaded_image(upload2)
@@ -1224,6 +1239,10 @@ def render_ct_tab(model, processor, config):
         # four whose dropzone lists no accepted types.
         help="Files may be extensionless (e.g. IM_0001) — a .dcm extension is not "
         "required.",
+        # The narrowing that matters most of the three: this uploader takes many
+        # files at once, filters none of them, and reads every slice fully into
+        # memory, so it should not inherit the slide tab's 2000 MB ceiling.
+        max_upload_size=NON_WSI_MAX_UPLOAD_MB,
         key="ct_files",
     )
 

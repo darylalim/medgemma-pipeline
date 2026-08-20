@@ -7,6 +7,27 @@
 [browser]
 gatherUsageStats = false
 
+# Streamlit's shipped ceiling is 200 MB, which rejects real diagnostic whole-slide
+# images (.svs/.ndpi routinely land 300 MB - 2 GB) at the HTTP layer, before any app
+# code runs and with a generic message. server.maxUploadSize is the only thing that
+# lifts it -- the limit is enforced three times server-side (Content-Length, streamed
+# body, parsed file) with no reference to any per-widget value, so max_upload_size= on
+# the widget can only narrow it.
+#
+# 2000 and not higher because peak memory is ~2x the file: the slide is held in
+# session_state as a BytesIO *and* copied whole by load_wsi_patches' getvalue() before
+# spilling to a temp file, so a 2 GB slide costs ~4 GB on top of the ~6 GB resident
+# model, on a machine whose slice/patch counts ram_aware_slice_cap is already rationing.
+# Raising this further wants a streaming refactor of that spill first -- but read the
+# getvalue()-not-read() gotcha in CLAUDE.md before attempting one.
+#
+# This raises the ceiling for EVERY uploader, so the three that don't want it pass an
+# explicit max_upload_size=200: both CXR slots, and (most importantly) the CT one,
+# which is accept_multiple_files=True, carries no type= filter by design, and reads
+# every slice fully into memory. Guarded by TestThemeConfig.
+[server]
+maxUploadSize = 2000
+
 # Nord theme — the arctic, north-bluish palette, applied as shipped in Streamlit's
 # bundled `nord` template (frost accents #88c0d0/#81a1c1, aurora semantics).
 #

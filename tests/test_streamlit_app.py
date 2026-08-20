@@ -1068,6 +1068,38 @@ class TestThemeConfig:
         assert self.CONFIG.is_file()
         assert isinstance(self._theme(), dict)  # raises if not valid TOML / no [theme]
 
+    def test_upload_ceiling_admits_a_real_whole_slide_image(self):
+        # Streamlit's default is 200 MB, which rejects real .svs/.ndpi slides (300 MB
+        # - 2 GB) at the HTTP layer -- before any app code runs, with a generic
+        # message -- in a tab whose loader and docs both reason about multi-GB slides.
+        # server.maxUploadSize is the only lever: the limit is enforced server-side
+        # against Content-Length, the streamed body and the parsed file, so a widget's
+        # max_upload_size= can only narrow it, never raise it. Deleting the key is
+        # silent (the 200 MB default takes back over), hence the pin.
+        #
+        # This lives in its own method rather than in the key walk below, which only
+        # ever descends into [theme] and would never see a [server] key.
+        server = self._config().get("server", {})
+        assert server.get("maxUploadSize") == 2000, (
+            "server.maxUploadSize must stay 2000 MB; the 200 MB default rejects "
+            "real whole-slide images"
+        )
+
+    def test_non_slide_uploaders_narrow_the_raised_ceiling(self):
+        # The ceiling above is global, so the three uploaders that are not the slide
+        # one have to opt back down. The CT uploader is the one that matters: it is
+        # accept_multiple_files=True, carries no type= filter by design, and reads
+        # every slice fully into memory, so inheriting 2000 MB gives it by far the
+        # widest blast radius of the four. Pinned as a pair -- raising the ceiling
+        # without these narrowings is the actual regression.
+        source = (
+            Path(__file__).resolve().parent.parent / "streamlit_app.py"
+        ).read_text()
+        assert "NON_WSI_MAX_UPLOAD_MB = 200" in source
+        assert source.count("max_upload_size=NON_WSI_MAX_UPLOAD_MB") == 3, (
+            "both CXR uploaders and the CT uploader must narrow back to 200 MB"
+        )
+
     def test_locks_a_single_mode(self):
         # The inverse of the auto-switch guard this replaced, and the point of the
         # current theme: Streamlit renders the light/dark switch in the settings menu
