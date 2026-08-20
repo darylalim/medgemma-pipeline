@@ -1,3 +1,12 @@
+# Streamlit's frontend posts anonymous usage events to data.streamlit.io and a
+# Fivetran webhook on every page load (browser.gatherUsageStats defaults to ON).
+# Inference here is fully on-device and the README says so, which makes telemetry the
+# largest outbound flow the app would have -- larger by far than the favicon fetch this
+# config also avoids. Verified with Playwright: with this off, the page makes zero
+# off-host requests. Guarded by TestThemeConfig.
+[browser]
+gatherUsageStats = false
+
 # Nord theme — the arctic, north-bluish palette, applied as shipped in Streamlit's
 # bundled `nord` template (frost accents #88c0d0/#81a1c1, aurora semantics).
 #

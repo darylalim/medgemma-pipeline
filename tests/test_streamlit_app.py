@@ -1009,17 +1009,33 @@ class TestMlxVlmContract:
 
 
 class TestThemeConfig:
-    """Guard the .streamlit/config.toml nord theme. Like TestMlxVlmContract, this
-    checks a real asset (not a mock): the file must parse, stay locked to a SINGLE mode
-    (Streamlit offers the light/dark switch only when both [theme.light] and
-    [theme.dark] exist, so neither may come back), and use only theme keys the
-    installed Streamlit recognizes."""
+    """Guard .streamlit/config.toml. Like TestMlxVlmContract, this checks a real asset
+    (not a mock): the file must parse, stay locked to a SINGLE mode (Streamlit offers
+    the light/dark switch only when both [theme.light] and [theme.dark] exist, so
+    neither may come back), use only theme keys the installed Streamlit recognizes, and
+    keep usage telemetry off. The last one is not a theme setting but shares the file
+    and the same invariant the theme keys are shaped around: an on-device app makes no
+    outbound requests."""
 
     CONFIG = Path(__file__).resolve().parent.parent / ".streamlit" / "config.toml"
 
-    def _theme(self) -> dict:
+    def _config(self) -> dict:
         with open(self.CONFIG, "rb") as f:
-            return tomllib.load(f)["theme"]
+            return tomllib.load(f)
+
+    def _theme(self) -> dict:
+        return self._config()["theme"]
+
+    def test_usage_stats_are_disabled(self):
+        # browser.gatherUsageStats defaults to ON, and Streamlit's frontend then posts
+        # to data.streamlit.io and a Fivetran webhook on every page load -- by a wide
+        # margin the largest outbound flow this app would have, in a project whose
+        # README promises nothing leaves the machine. Deleting the key is silent (the
+        # default takes over), which is exactly why it is pinned.
+        browser = self._config().get("browser", {})
+        assert browser.get("gatherUsageStats") is False, (
+            "browser.gatherUsageStats must be explicitly false; the default is on"
+        )
 
     def test_config_exists_and_parses(self):
         assert self.CONFIG.is_file()
@@ -1092,6 +1108,60 @@ class TestThemeConfig:
 
         walk(self._theme(), "theme")
         assert not unknown, f"unrecognized theme keys: {unknown}"
+
+
+class TestFaviconAsset:
+    """Guard the browser-tab favicon. Like TestThemeConfig, this checks a real
+    checked-in asset: Streamlit resolves a ``:material/...:`` page_icon to an SVG on
+    fonts.gstatic.com and refetches it on EVERY page load, which would be the only
+    outbound request an otherwise fully on-device app makes. Vendoring the glyph as a
+    local PNG moves it to Streamlit's own /media/ endpoint -- so this pins both halves:
+    the file is really there and really a PNG, and set_page_config still points at it
+    rather than drifting back to the remote form (which would fail no other test)."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_favicon_file_exists_and_is_a_valid_png(self):
+        import streamlit_app
+
+        path = streamlit_app.FAVICON_PATH
+        assert path.is_file(), f"favicon missing at {path}"
+        # Resolved from __file__, not the CWD: `streamlit run` from another directory
+        # must still find it.
+        assert path.is_absolute() and self.ROOT in path.parents
+        with Image.open(path) as icon:
+            icon.load()  # forces the decode, so a truncated commit fails here
+            assert icon.format == "PNG"
+            assert icon.width == icon.height, "favicon should be square"
+
+    def test_favicon_is_visible(self):
+        # A re-render that lands fully transparent (or a stray all-white glyph on the
+        # light tab strip) is silently invisible in the browser. Require real opaque
+        # pixels, and require them not to be near-black -- the stock Material glyph is
+        # #000 and all but disappears against a dark tab strip, which is why the
+        # vendored copy is recolored to the theme's primary.
+        import streamlit_app
+
+        with Image.open(streamlit_app.FAVICON_PATH) as icon:
+            pixels = np.asarray(icon.convert("RGBA"), dtype=np.int16)
+        height, width = pixels.shape[:2]
+        opaque = pixels[pixels[:, :, 3] > 200]
+        assert len(opaque) > 0.02 * height * width, "favicon is ~empty"
+        assert int(opaque[:, :3].sum(axis=1).max()) > 200, (
+            "favicon glyph is too dark to read on a dark tab strip"
+        )
+
+    def test_page_icon_points_at_the_local_file(self):
+        # The invariant that actually costs something if it regresses. A one-word edit
+        # back to ":material/clinical_notes:" restores the per-page-load CDN fetch and
+        # looks identical in the browser, so nothing else would catch it.
+        source = (self.ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+        match = re.search(r"page_icon=(.+?),", source)
+        assert match, "no page_icon= argument found in streamlit_app.py"
+        assert match.group(1) == "str(FAVICON_PATH)", (
+            f"page_icon is {match.group(1)!r}; a :material/...: value refetches the "
+            "icon from fonts.gstatic.com on every page load"
+        )
 
 
 class TestHooksConfig:
@@ -2149,6 +2219,7 @@ class TestClaudeMd:
         text = self._text()
         for name in (
             "_WorkflowGuard",
+            "TestFaviconAsset",
             "TestCiWorkflow",
             "TestReleaseWorkflow",
             "TestAutoReleaseWorkflow",

@@ -25,7 +25,7 @@ Using MedGemma through this app is subject to Google's [Health AI Developer Foun
 - RAM-aware cap on CT slices / WSI patches (multi-image inference is memory-heavy on unified memory)
 - Results stay visible across reruns and clear — with a hint — when you change the inputs
 - Nord dark theme — a calm, low-glare surround for reading medical images
-- Fully local inference on Apple Silicon via MLX
+- Fully local inference on Apple Silicon via MLX — after the one-time model download the app makes **no outbound network requests**: usage telemetry is off, and fonts and the tab icon are served from the app itself
 
 ## Setup
 

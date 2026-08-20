@@ -4,6 +4,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import BinaryIO
 
 import numpy as np
@@ -20,6 +21,16 @@ from pydicom.pixels import apply_rescale
 load_dotenv()
 
 MODEL_ID = "mlx-community/medgemma-1.5-4b-it-8bit"
+
+# Browser-tab favicon, vendored as a local PNG rather than named as
+# ":material/clinical_notes:". Streamlit resolves a :material/...: page_icon to an SVG
+# on fonts.gstatic.com and refetches it on every page load -- the only outbound request
+# an otherwise fully on-device app would make. A local file is served from Streamlit's
+# own /media/ endpoint instead. Resolved against __file__, not the CWD, so `streamlit
+# run` from any directory finds it. Source glyph: Material Symbols Rounded
+# `clinical_notes` (Apache-2.0), recolored to the theme's primary #88c0d0 -- the stock
+# glyph is black and all but invisible against a dark browser tab strip.
+FAVICON_PATH = Path(__file__).resolve().parent / "assets" / "favicon.png"
 
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 
@@ -604,7 +615,7 @@ def load_uploaded_image(uploaded_file) -> Image.Image | None:
 
 st.set_page_config(
     page_title="MedGemma Studio",
-    page_icon=":material/clinical_notes:",
+    page_icon=str(FAVICON_PATH),
     layout="centered",
 )
 
