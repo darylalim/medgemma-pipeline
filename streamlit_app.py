@@ -1132,18 +1132,20 @@ def render_wsi_tab(model, processor, config):
     slide_file = st.file_uploader("Upload a slide", type=WSI_TYPES, key="wsi_files")
     # segmented_control (not select_slider): these are four discrete objective-power
     # modes, like a microscope turret, and one-tap selection beats landing a slider
-    # handle on a tick. ``or WSI_DEFAULT_MAG`` guards the (single-select) None case.
-    target_mag = (
-        st.segmented_control(
-            "Magnification",
-            options=WSI_MAGNIFICATIONS,
-            default=WSI_DEFAULT_MAG,
-            format_func=lambda m: f"{m}×",
-            help="Higher magnification shows finer detail over less area. Clamped to "
-            "the slide's available pyramid levels.",
-            key="wsi_mag",
-        )
-        or WSI_DEFAULT_MAG
+    # handle on a tick. ``required=True`` because a single-select segmented_control
+    # otherwise returns None when the user taps the already-selected chip -- which
+    # left no chip highlighted while an ``or WSI_DEFAULT_MAG`` fallback quietly
+    # analyzed at 10x, i.e. the visible control and the magnification sent to the
+    # model disagreed. It also narrows the return type from ``int | None`` to ``int``.
+    target_mag = st.segmented_control(
+        "Magnification",
+        options=WSI_MAGNIFICATIONS,
+        default=WSI_DEFAULT_MAG,
+        required=True,
+        format_func=lambda m: f"{m}×",
+        help="Higher magnification shows finer detail over less area. Clamped to "
+        "the slide's available pyramid levels.",
+        key="wsi_mag",
     )
 
     default_patches, max_patches = ram_aware_slice_cap()
