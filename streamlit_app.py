@@ -94,7 +94,15 @@ DISCLAIMER_TEXT = (
 )
 
 
-@st.cache_resource
+# The cache's own spinner is the one that renders on a cold start -- exactly the miss
+# this message exists for -- so own the text here instead of wrapping the call site.
+# The default show_spinner=True builds its message from the function name, leaking
+# "Running load_model()." into the UI alongside any outer st.spinner. show_time gives
+# the ~6 GB first-run download visible evidence that it is progressing; a warm rerun
+# shows nothing, since a cache hit lands inside the spinner's 0.5s delay.
+@st.cache_resource(
+    show_spinner="Loading MedGemma (first run downloads ~6 GB)…", show_time=True
+)
 def load_model():
     model, processor = load(MODEL_ID)
     config = load_config(MODEL_ID)
@@ -1289,8 +1297,7 @@ def render_wsi_tab(model, processor, config):
 def main():
     st.title("MedGemma Studio")
     st.warning(DISCLAIMER_TEXT, icon=":material/warning:")
-    with st.spinner("Loading model..."):
-        model, processor, config = load_model()
+    model, processor, config = load_model()
     tab_ask, tab_cxr, tab_ct, tab_wsi = st.tabs(
         [
             ":material/forum: Ask",
