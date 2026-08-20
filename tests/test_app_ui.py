@@ -1129,6 +1129,36 @@ def test_ct_multi_frame_shows_error_not_crash(patched_mlx):
     assert any("single-frame" in e.value for e in at.error)
 
 
+def test_ct_accepts_extensionless_dicom_filenames(patched_mlx, monkeypatch):
+    # The CT uploader deliberately passes no ``type=`` filter, unlike the CXR and WSI
+    # ones: per-slice exports off a PACS or a study CD are routinely extensionless
+    # (``IM_0001``, a bare SOP UID). Adding ``type=["dcm"]`` as a
+    # consistency tidy-up would silently start rejecting real series -- and every other
+    # DICOM fixture here is named ``a.dcm``, so nothing else would go red. Malformed
+    # uploads are load_ct_volume's job (test_ct_invalid_dicom_shows_error), not the
+    # uploader's.
+    captured = {}
+    monkeypatch.setattr(
+        "mlx_vlm.prompt_utils.apply_chat_template",
+        lambda *a, **k: captured.update(act_kwargs=k) or "prompt",
+    )
+    out = MagicMock()
+    out.text = "Two contiguous slices of the liver."
+    _patch_stream(monkeypatch, lambda *a, **k: out)
+    at = _app_test().run()
+    at.text_input(key="ct_prompt").set_value("Describe").run()
+    at.file_uploader(key="ct_files").upload(
+        "IM_0001", _dicom_bytes(1, 100), "application/octet-stream"
+    ).upload(
+        "1.2.840.10008.5.1.4.1.1.2", _dicom_bytes(2, 200), "application/octet-stream"
+    ).run()
+    at.button(key="ct_run").click().run()
+    assert not at.exception
+    assert not at.error
+    assert captured["act_kwargs"]["num_images"] == 2
+    assert "Two contiguous slices of the liver." in [m.value for m in at.markdown]
+
+
 def test_ct_result_persists_across_rerun(patched_mlx, monkeypatch):
     _force_ram_gib(monkeypatch, 32)
     calls = []

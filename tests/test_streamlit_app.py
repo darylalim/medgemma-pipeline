@@ -748,6 +748,27 @@ class TestLoadWsiPatches:
         assert isinstance(overlay, Image.Image)
         assert actual_mag == 40.0
 
+    def test_rereads_the_same_stream_after_position_advances(self, monkeypatch):
+        # The WSI mirror of TestLoadCtVolume's rewind guard. Streamlit keeps the
+        # uploaded BytesIO in session_state, so a second Run spills the SAME stream --
+        # already at EOF from the first. ``getvalue()`` is position-independent and so
+        # survives that; a chunked ``copyfileobj``/``.read()`` refactor (tempting,
+        # since a slide can be multi-GB) would spill an EMPTY file the second time and
+        # fail on a slide that worked a moment earlier. Only reading back what landed
+        # on disk catches it -- a fake that ignores ``path`` passes either way.
+        spilled = []
+
+        def _open(path):
+            spilled.append(Path(path).read_bytes())
+            return _make_slide()
+
+        monkeypatch.setattr("openslide.OpenSlide", _open)
+        upload = io.BytesIO(b"slide-bytes")
+        load_wsi_patches(upload, 40, max_patches=2)
+        upload.read()  # leave the stream at EOF, where a second Run finds it
+        load_wsi_patches(upload, 40, max_patches=2)
+        assert spilled == [b"slide-bytes", b"slide-bytes"]
+
     def test_tissue_filtering_reduces_patch_count(self, monkeypatch):
         # Tissue only on the slide's left third: the 3x3 grid (nine tiles) is filtered
         # end-to-end down to the three left-column patches, even though eight were
