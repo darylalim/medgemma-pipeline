@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import fnmatch
 import inspect
@@ -20,6 +21,7 @@ from streamlit_app import (
     CT_THUMBNAIL_SIZE,
     LOCALIZATION_INSTRUCTION,
     _detect_total_ram_gib,
+    _file_sig,
     _read_patch,
     _slide_objective_power,
     build_messages,
@@ -47,6 +49,39 @@ from streamlit_app import (
 from tests.dicom_helpers import dicom_bytes as _dicom_bytes
 
 THINKING_INSTRUCTION = "SYSTEM INSTRUCTION: think silently if needed. Be helpful."
+
+APP_SOURCE = Path(__file__).resolve().parent.parent / "streamlit_app.py"
+
+
+def _calls_to(dotted: str) -> list[ast.Call]:
+    """Every ``st.<name>(...)`` call in the app, as AST nodes.
+
+    Structural rather than textual: a `source.count("...")` guard is satisfied by a
+    comment that merely mentions the string, and says nothing about *which* call
+    carries a kwarg. Parsing gives per-call-site assertions instead.
+    """
+    obj, attr = dotted.split(".", 1)
+    tree = ast.parse(APP_SOURCE.read_text())
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == obj
+    ]
+
+
+def _file_uploader_kwargs() -> dict[str, dict[str, str]]:
+    """``{widget key: {kwarg name: source text of its value}}`` for every uploader."""
+    out = {}
+    for call in _calls_to("st.file_uploader"):
+        kwargs = {k.arg: ast.unparse(k.value) for k in call.keywords if k.arg}
+        key = kwargs.pop("key", None)
+        if key is not None:
+            out[ast.literal_eval(key)] = kwargs
+    return out
 
 
 @pytest.fixture
@@ -502,6 +537,42 @@ class TestSubsampleIndices:
         assert all(0 <= i < 57 for i in idx)
 
 
+class TestFileSig:
+    """Guard the identity the staleness gate compares uploads by.
+
+    Reverting ``_file_sig`` to (name, size) leaves every AppTest staleness test green,
+    because those all vary the filename -- so without this class the fix it encodes is
+    a comment, not an invariant.
+    """
+
+    def test_distinguishes_uploads_sharing_a_name_and_size(self):
+        # The failure this exists to prevent: per-slice DICOMs off one scanner share
+        # a name pattern and, at a fixed protocol, a byte size. Under (name, size)
+        # two different studies compare equal, so fresh_result_or_hint serves the
+        # previous patient's report as fresh with no "Inputs changed" hint.
+        a = SimpleNamespace(file_id="upload-a", name="IM_0001", size=524288)
+        b = SimpleNamespace(file_id="upload-b", name="IM_0001", size=524288)
+        assert _file_sig(a) != _file_sig(b)
+
+    def test_is_stable_for_one_upload_across_reruns(self):
+        # The other half: the signature must NOT change for the same upload, or every
+        # rerun would strand its own result behind a staleness hint.
+        upload = SimpleNamespace(file_id="upload-a", name="IM_0001", size=524288)
+        assert _file_sig(upload) == _file_sig(upload)
+
+    def test_falls_back_to_name_and_size_without_a_file_id(self):
+        # A plain BytesIO (unit tests, and anything not routed through Streamlit's
+        # uploader) has no file_id; the fallback keeps it comparable rather than
+        # collapsing every such object to one signature.
+        x = SimpleNamespace(name="a.dcm", size=10)
+        y = SimpleNamespace(name="b.dcm", size=10)
+        assert _file_sig(x) == ("a.dcm", 10)
+        assert _file_sig(x) != _file_sig(y)
+
+    def test_no_file_is_the_empty_signature(self):
+        assert _file_sig(None) == ()
+
+
 class TestLoadCtVolume:
     def test_sorts_by_instance_number_and_converts_to_hu(self):
         # Files out of order; the fill value encodes order so we can verify sorting.
@@ -514,6 +585,35 @@ class TestLoadCtVolume:
     def test_subsamples_to_cap(self):
         files = [_dicom_bytes(i, 100 + i) for i in range(1, 21)]  # 20 slices
         assert len(load_ct_volume(files, max_slices=5)) == 5
+
+    def test_downcasts_float64_hu_arrays_to_float32(self):
+        # apply_rescale returns float64; nothing downstream wants that precision
+        # (normalize_hu opens with .astype(np.float32)), and it doubles what
+        # cached_ct_volume holds. Values must survive the cast unchanged.
+        vol = load_ct_volume([_dicom_bytes(1, 100)], max_slices=1)
+        assert vol[0].dtype == np.float32
+        assert vol[0][0, 0] == 100 - 1024
+
+    def test_leaves_an_integer_hu_array_alone(self, monkeypatch):
+        # The `if hu.dtype == np.float64` guard is load-bearing, not defensive noise.
+        # apply_rescale returns uint8/uint16 when a Modality LUT Sequence (0028,3000)
+        # is present, and the array untouched when there are no rescale tags at all.
+        # An unconditional .astype(np.float32) -- which reads as obviously equivalent
+        # -- would *quadruple* a uint8 slice inside the very cache the downcast exists
+        # to shrink. Nothing else notices: dicom_helpers only builds rescale-tagged
+        # slices, so this is the only test that fails when the guard is dropped.
+        import streamlit_app
+
+        monkeypatch.setattr(
+            streamlit_app,
+            "apply_rescale",
+            lambda arr, ds: np.asarray(arr, dtype=np.uint8),
+        )
+        vol = load_ct_volume([_dicom_bytes(1, 100)], max_slices=1)
+        assert vol[0].dtype == np.uint8, (
+            "the float64 guard was dropped; an integer Modality-LUT slice is now "
+            "upcast, growing the cache instead of shrinking it"
+        )
 
     def test_applies_rescale_slope_and_intercept(self):
         files = [_dicom_bytes(1, 10, slope=2.0, intercept=-1000.0)]
@@ -1024,6 +1124,39 @@ class TestMlxVlmContract:
             fields = set(dir(GenerationResult))
         assert "text" in fields
 
+    def test_generation_result_exposes_finish_reason(self):
+        # run_model()'s _record_finish reads chunk.finish_reason to decide whether a
+        # run stopped at the token cap, which is what drives warn_if_truncated. It
+        # reads it via getattr(..., None) -- necessary, because the tests hand
+        # run_model MagicMock chunks carrying only .text -- and that tolerance is
+        # exactly why this guard has to exist: an upstream rename would make the
+        # attribute silently absent, every truncated report would render as a
+        # complete one, and no other test would notice (test_app_ui.py sets
+        # finish_reason on its own mocks by hand). GenerationResult already carries
+        # a dozen diffusion-only fields, so churn on this dataclass is live.
+        from mlx_vlm import GenerationResult
+
+        if dataclasses.is_dataclass(GenerationResult):
+            fields = {f.name for f in dataclasses.fields(GenerationResult)}
+        else:
+            fields = set(dir(GenerationResult))
+        assert "finish_reason" in fields, (
+            "GenerationResult.finish_reason is gone; warn_if_truncated would "
+            "silently stop firing on token-capped runs"
+        )
+
+    def test_stream_generate_still_reports_a_length_finish_reason(self):
+        # The attribute existing is not enough: run_model compares it to the literal
+        # "length". Assert that spelling still appears in the dispatch module that
+        # yields these chunks, so a rename to e.g. "max_tokens" fails here rather
+        # than by quietly never matching.
+        from mlx_vlm.generate import dispatch
+
+        source = inspect.getsource(dispatch)
+        assert 'finish_reason = "length"' in source or 'finish_reason="length"' in (
+            source
+        ), "mlx-vlm no longer reports finish_reason == 'length' on a token-cap stop"
+
     def test_apply_chat_template_accepts_num_images(self):
         # run_model() calls apply_chat_template(..., num_images=).
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -1092,13 +1225,48 @@ class TestThemeConfig:
         # every slice fully into memory, so inheriting 2000 MB gives it by far the
         # widest blast radius of the four. Pinned as a pair -- raising the ceiling
         # without these narrowings is the actual regression.
+        #
+        # Asserted per widget rather than by occurrence count. A bare
+        # `source.count(...) == 3` says nothing about WHICH uploaders carry the kwarg:
+        # move it off the CT uploader and onto the slide one and the count is still
+        # three, leaving the CT tab silently on 2000 MB and real slides rejected at
+        # 200 -- exactly the pair of regressions this test exists to catch. A count is
+        # also broken by any unrelated comment that names the constant.
+        uploaders = _file_uploader_kwargs()
+        assert set(uploaders) == {"cxr_image1", "cxr_image2", "ct_files", "wsi_files"}
+        for key in ("cxr_image1", "cxr_image2", "ct_files"):
+            assert uploaders[key].get("max_upload_size") == "NON_WSI_MAX_UPLOAD_MB", (
+                f"{key} must narrow back to NON_WSI_MAX_UPLOAD_MB"
+            )
+        assert "max_upload_size" not in uploaders["wsi_files"], (
+            "the slide uploader must keep the raised server ceiling; narrowing it "
+            "re-rejects the multi-GB slides this config exists to admit"
+        )
         source = (
             Path(__file__).resolve().parent.parent / "streamlit_app.py"
         ).read_text()
         assert "NON_WSI_MAX_UPLOAD_MB = 200" in source
-        assert source.count("max_upload_size=NON_WSI_MAX_UPLOAD_MB") == 3, (
-            "both CXR uploaders and the CT uploader must narrow back to 200 MB"
-        )
+
+    def test_expanders_never_carry_an_icon(self):
+        # AppTest classifies an expandable block by whether it carries an icon --
+        # `if block.expandable.icon: Status(...) else Expander(...)` in
+        # testing/v1/element_tree.py -- because that is how st.status is built. So an
+        # icon on a plain expander moves it out of at.expander and into at.status,
+        # where .state raises ValueError("Unknown Status state") on any glyph that is
+        # not one of st.status's own three.
+        #
+        # Adding two apt Material glyphs cost five simultaneous failures once already
+        # (the "Thinking trace"/"Model settings" label lookups plus the CT/WSI
+        # at.status[0].state error assertions), none of which name the cause. This
+        # turns that five-test mystery into one message. type="compact" is unaffected
+        # and stays.
+        for call in _calls_to("st.expander"):
+            kwargs = {k.arg for k in call.keywords if k.arg}
+            assert "icon" not in kwargs, (
+                f"st.expander at line {call.lineno} passes icon=, which reclassifies "
+                "it as an st.status under AppTest and breaks the harness's "
+                "status/expander discrimination"
+            )
 
     def test_locks_a_single_mode(self):
         # The inverse of the auto-switch guard this replaced, and the point of the
