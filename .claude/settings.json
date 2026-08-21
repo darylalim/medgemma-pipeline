@@ -24,15 +24,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py) cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1; out=$(uv run ruff check \"$f\" 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in *..*) exit 0 ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py) cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix \"$f\" >/dev/null 2>&1; uv run ruff format \"$f\" >/dev/null 2>&1; out=$(uv run ruff check \"$f\" 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
           },
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py) cd \"$CLAUDE_PROJECT_DIR\" || exit 0; out=$(uv run ty check 2>&1) || { echo \"$out\" >&2; exit 2; } ;; esac; exit 0"
-          },
-          {
-            "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); [ -n \"$f\" ] || exit 0; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py|*.toml|*/.claude/settings.json) mkdir -p \"$CLAUDE_PROJECT_DIR/.claude\" && touch \"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\" ;; esac; exit 0"
+            "command": "[ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; s=\"$CLAUDE_PROJECT_DIR/.claude/.tests-needed\"; arm() { mkdir -p \"$CLAUDE_PROJECT_DIR/.claude\" 2>/dev/null; : >\"$s\" 2>/dev/null; }; command -v jq >/dev/null 2>&1 || { arm; exit 0; }; f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null) || f=\"\"; [ -n \"$f\" ] || { arm; exit 0; }; case \"$f\" in /*) ;; *) f=\"$CLAUDE_PROJECT_DIR/$f\" ;; esac; case \"$f\" in *..*) exit 0 ;; esac; case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*) ;; *) exit 0 ;; esac; case \"$f\" in *.py|*.toml|*.yml|*.yaml|*.md|*/LICENSE|*/.claude/settings.json) arm ;; esac; exit 0"
           }
         ]
       }

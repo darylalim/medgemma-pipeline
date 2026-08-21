@@ -1425,7 +1425,7 @@ class TestHooksConfig:
         assert isinstance(self._hooks(), dict)
 
     def test_expected_events_are_wired(self):
-        # Deleting an event silently drops that automation (format/type-check on edit,
+        # Deleting an event silently drops that automation (lint/format on edit,
         # the secret guard, or run-tests-on-stop), so pin the three we configured.
         assert {"PreToolUse", "PostToolUse", "Stop"} <= set(self._hooks())
 
@@ -1663,11 +1663,23 @@ class TestHooksConfig:
         [
             ("a.py", True),
             ("pyproject.toml", True),
-            ("notes.md", False),
+            # .md / .yml / LICENSE arm too. Nine guard classes -- TestClaudeMd,
+            # TestDocsMatchSource, TestLicense, TestReadmeAssets, TestCiWorkflow and
+            # the three workflow guards -- test exactly those files and have no other
+            # local trigger, so "a docs-only turn is free" was never true here: 15 of
+            # the first 122 commits touched a guarded file while arming nothing,
+            # including the CLAUDE.md rewrite TestClaudeMd exists to catch.
+            ("notes.md", True),
+            ("LICENSE", True),
+            (".github/workflows/ci.yml", True),
             # A relative path has to resolve against the project root, or the
             # `*/.claude/settings.json` arm never matches and a hooks change ships
             # with the suite unrun -- the same fall-open fixed in the guard.
             (".claude/settings.json", True),
+            # TestFaviconAsset guards a binary asset, but Edit/Write cannot produce a
+            # valid PNG, so arming here would only ever bill the suite for a write
+            # that could not have happened.
+            ("assets/favicon.png", False),
         ],
     )
     def test_sentinel_hook_marks_testable_edits(self, tmp_path, rel, marks):
@@ -1687,6 +1699,33 @@ class TestHooksConfig:
         assert (root / ".claude" / ".tests-needed").exists() is marks
 
     @requires_jq
+    def test_sentinel_arms_when_the_event_cannot_be_read(self, tmp_path):
+        # This hook is the ONLY thing that arms the Stop gate, so "I don't know what
+        # was written" has to mean ARM, not exit quietly: the old command returned 0
+        # having written nothing, leaving the suite silently un-run with no signal
+        # anywhere -- and the four Stop tests stay green through it, because each one
+        # creates the sentinel by hand. It arms via a builtin redirect rather than
+        # `touch`, so an empty PATH cannot stop it either.
+        root = tmp_path / "proj"
+        (root / ".claude").mkdir(parents=True)
+        sentinel = root / ".claude" / ".tests-needed"
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        cmd = self._command("PostToolUse", "tests-needed")
+        r = self._run(
+            cmd,
+            {"tool_input": {"file_path": "a.py"}},
+            env={"PATH": str(empty), "CLAUDE_PROJECT_DIR": str(root)},
+        )
+        assert r.returncode == 0
+        assert sentinel.exists(), "a missing jq must arm the gate, not skip it"
+        sentinel.unlink()
+        # jq present, event unparseable -- the same "I don't know" condition.
+        r = self._run(cmd, "not json", env=self._hook_env(empty, root))
+        assert r.returncode == 0
+        assert sentinel.exists(), "an unreadable event must arm the gate"
+
+    @requires_jq
     def test_post_edit_hooks_ignore_files_outside_the_project(self, tmp_path):
         # A scratch .py outside the repo is not ours: linting it with project rules
         # blocks on unrelated violations, and arming the sentinel bills the ~21s suite
@@ -1700,7 +1739,7 @@ class TestHooksConfig:
         bindir.mkdir()
         self._shim(bindir, "uv", f'touch "{tmp_path}/uv-ran"\nexit 1\n')
         env = self._hook_env(bindir, root)
-        for needle in ("ruff", "ty check", "tests-needed"):
+        for needle in ("ruff", "tests-needed"):
             r = self._run(
                 self._command("PostToolUse", needle),
                 {"tool_input": {"file_path": str(outside)}},
@@ -1709,6 +1748,21 @@ class TestHooksConfig:
             assert r.returncode == 0, f"{needle}: exit {r.returncode}"
         assert not (tmp_path / "uv-ran").exists()  # no gate was invoked at all
         assert not (root / ".claude" / ".tests-needed").exists()
+        # The RELATIVE form of the same escape, which the absolute cases above cannot
+        # see: joining "../elsewhere/scratch.py" onto the project root yields a string
+        # that still *starts* with that root, so the prefix check alone falls open.
+        # Before the `*..*` arm, ruff rewrote this outside file in place -- with this
+        # project's rules -- while the hook reported exit 0.
+        for needle in ("ruff", "tests-needed"):
+            r = self._run(
+                self._command("PostToolUse", needle),
+                {"tool_input": {"file_path": f"../elsewhere/{outside.name}"}},
+                env=env,
+            )
+            assert r.returncode == 0, f"{needle} (relative): exit {r.returncode}"
+        assert not (tmp_path / "uv-ran").exists()
+        assert not (root / ".claude" / ".tests-needed").exists()
+        assert outside.read_text().startswith("# zzz"), "outside file was rewritten"
 
     @requires_jq
     def test_ruff_hook_runs_on_py_and_skips_others(self, tmp_path):
@@ -1766,29 +1820,6 @@ class TestHooksConfig:
         )
         assert r.returncode == 2
         assert "E501" in r.stderr
-
-    @requires_jq
-    def test_ty_hook_surfaces_errors_on_py_only(self, tmp_path):
-        # .py edit + failing type check -> exit 2 (feedback to Claude); .md -> exit 0.
-        root = tmp_path / "proj"
-        root.mkdir()
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
-        self._shim(bindir, "uv", 'echo "type error" >&2\nexit 1\n')
-        env = self._hook_env(bindir, root)
-        ty = self._command("PostToolUse", "ty check")
-        assert (
-            self._run(
-                ty, {"tool_input": {"file_path": str(root / "a.py")}}, env=env
-            ).returncode
-            == 2
-        )
-        assert (
-            self._run(
-                ty, {"tool_input": {"file_path": str(root / "a.md")}}, env=env
-            ).returncode
-            == 0
-        )
 
 
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
