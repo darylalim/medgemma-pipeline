@@ -24,7 +24,16 @@ gatherUsageStats = false
 # This raises the ceiling for EVERY uploader, so the three that don't want it pass an
 # explicit max_upload_size=200: both CXR slots, and (most importantly) the CT one,
 # which is accept_multiple_files=True, carries no type= filter by design, and reads
-# every slice fully into memory. Guarded by TestThemeConfig.
+# every slice fully into memory.
+#
+# Be precise about what that narrowing is, though: max_upload_size is a FRONTEND
+# bound only. It travels to the browser as FileUploader.max_upload_size_mb
+# (elements/widgets/file_uploader.py) and nothing server-side ever reads it -- the
+# three checks above resolve config.get_option("server.maxUploadSize") every time. So
+# the per-widget value stops an accidental multi-GB drop on the CT dropzone, which is
+# the realistic failure on a localhost single-user app; it is NOT a server-enforced
+# cap, and a POST that bypasses the stock frontend is bounded only by the 2000 here.
+# Guarded by TestThemeConfig.
 [server]
 maxUploadSize = 2000
 
