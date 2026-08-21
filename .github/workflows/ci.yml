@@ -39,10 +39,11 @@ jobs:
           # release turn a green PR red with no repo change -- and the failure is
           # indistinguishable from a genuinely stale lock. Bump with `uv lock`.
           version: "0.12.5"
-          # Narrower than setup-uv's default, which also keys on pyproject.toml: a
-          # pyproject edit that leaves the resolution alone (ruff rules, [project.urls])
-          # shouldn't evict 86 packages. enable-cache is left at its `auto` default --
-          # that already resolves to on for a GitHub-hosted runner, so stating it is noise.
+          # Keys on the only file that changes the resolution; enable-cache stays absent
+          # because `auto` already resolves to on here. Expect little from any of it:
+          # setup-uv prunes wheels by default and every dep here IS a wheel, so the cache
+          # restores ~2 KB and uv re-downloads all 86 packages anyway (~1s saved). Read
+          # CLAUDE.md before "fixing" that with prune-cache: false -- it is a net loss.
           cache-dependency-glob: uv.lock
 
       - name: Sync (locked)

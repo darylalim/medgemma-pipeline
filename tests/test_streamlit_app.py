@@ -2010,10 +2010,12 @@ class TestCiWorkflow(_WorkflowGuard):
         )
 
     def test_cache_key_is_only_the_lockfile(self):
-        # setup-uv's DEFAULT cache-dependency-glob is a seven-pattern list that includes
-        # `**/pyproject.toml`, so reverting to it would evict an 86-package cache on
-        # every ruff-rule or [project.urls] edit. `uv sync --locked` catches lock drift
-        # regardless of what the cache holds, so narrowing here is purely a speed knob.
+        # setup-uv's DEFAULT cache-dependency-glob also keys on `**/pyproject.toml`, so
+        # reverting to it would miss the key -- and re-save -- on every ruff-rule or
+        # [project.urls] edit. Don't overrate the win: setup-uv prunes wheels by default
+        # and every dep here IS a wheel, so the restore is ~2 KB and uv re-downloads all
+        # 86 packages anyway. `uv sync --locked` catches lock drift regardless of what
+        # the cache holds, so narrowing here is purely a (small) speed knob.
         with_ = self._step_with(self._doc(), "astral-sh/setup-uv")
         assert with_.get("cache-dependency-glob") == "uv.lock", (
             f"cache key is {with_.get('cache-dependency-glob')!r}, not the lockfile"
@@ -2235,8 +2237,9 @@ class TestAutoReleaseWorkflow(_WorkflowGuard):
     def test_skips_a_version_that_is_already_released(self):
         # The idempotency key is repository STATE ("is there a release for the version
         # pyproject.toml claims?"), never a diff. A `git diff HEAD^ HEAD` detector
-        # breaks on squash merges, force pushes, several commits in one push and job
-        # re-runs; a state check survives all four and makes a re-run a safe no-op.
+        # breaks under checkout's default fetch-depth: 1 (HEAD^ does not resolve), on
+        # force pushes, on several commits in one push when the bump is not the last,
+        # and on job re-runs; a state check survives all four, making a re-run a no-op.
         cmds = self._run_commands(self._doc())
         assert "gh release view" in cmds, (
             "no already-released check — a re-run would try to publish twice"

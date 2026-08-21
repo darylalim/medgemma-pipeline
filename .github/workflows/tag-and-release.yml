@@ -81,9 +81,10 @@ jobs:
       - name: Publish the release this version has not had yet
         # Idempotent on repository STATE -- "does a release exist for the version
         # pyproject.toml claims?" -- rather than on a commit diff. A
-        # `git diff HEAD^ HEAD -- pyproject.toml` detector breaks on squash merges,
-        # force pushes, several commits in one push and job re-runs; a state check
-        # survives all four, so re-running this job is always a safe no-op.
+        # `git diff HEAD^ HEAD -- pyproject.toml` detector breaks under checkout's
+        # default fetch-depth: 1 (HEAD^ does not resolve), on force pushes, on several
+        # commits in one push when the bump is not the last, and on job re-runs; a
+        # state check survives all four, so re-running this job is always a safe no-op.
         #
         # `gh release create --target <sha>` creates the tag AND publishes in a single
         # API call, so there is no window where the tag exists but the release doesn't.

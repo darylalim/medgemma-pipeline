@@ -40,10 +40,12 @@ APP_PATH = str(Path(__file__).parent.parent / "streamlit_app.py")
 #
 # Because the cost is one-time, charge it to a one-time warmup instead of to whichever
 # test happens to run first. That keeps the per-run bound tight, which matters because
-# the bound is per test, not per suite: at 60s a hang would cost 82 tests x 60s = 82
+# the bound is per test, not per suite: at 60s a hang would cost 90 tests x 60s = 90
 # minutes and CI would hit ci.yml's 15-minute job cap with no pytest report at all --
-# strictly worse than the 3s default it replaced. At 8s that worst case is ~11 minutes
-# and still reports. 8s is ~3x the slowest test measured here (~2.5s, and that one is
+# strictly worse than the 3s default it replaced. At 8s that worst case is ~12 minutes
+# and still reports, but the margin has thinned: this was sized at 82 tests, and the
+# count grows while the cap does not. Re-check it, not just the multiplier, when it
+# next moves. 8s is ~3x the slowest test measured here (~2.5s, and that one is
 # slow for its own reasons -- decoding a deliberately invalid image -- not from this
 # import); a typical warmed run is ~0.03s. Raising it trades that headroom against the
 # multiplier above, so re-do the arithmetic before nudging it up.
