@@ -636,8 +636,9 @@ def load_wsi_patches(
 # the staleness gate keys on, so the cache and the freshness check agree on what
 # "the same file" means. Both wrappers below are ``scope="session"``: a ``file_id``
 # is minted per upload per session, so an entry outliving its session can never be
-# hit again -- it is only ~40-48 MB of decoded imaging waiting on max_entries
-# eviction, in an app whose slice budget is already hand-tuned against installed RAM.
+# hit again -- it is only ~21 MB (CT) / ~48 MB (WSI) of decoded imaging waiting on
+# max_entries eviction, in an app whose slice budget is already hand-tuned against
+# installed RAM.
 _UPLOAD_HASH: dict[str | type[Any], Callable[[Any], Any]] = {
     "streamlit.runtime.uploaded_file_manager.UploadedFile": lambda f: f.file_id
 }
@@ -657,9 +658,10 @@ def cached_ct_volume(
     itself would turn ``TestLoadCtVolume``'s rewind guard into a cache hit and stop
     it testing the rewind. ``max_entries=3`` leaves room to A/B a couple of slice
     counts and still hit; the cache trades memory for that, so it is bounded on
-    purpose -- at the RAM-gated default of 20 slices an entry is ~40 MB of HU
-    arrays, and ``ram_aware_slice_cap`` only lets the count grow on machines with
-    the memory to absorb it.
+    purpose -- at the RAM-gated default of 20 slices an entry is ~21 MB of float32 HU
+    arrays (it was double that before ``load_ct_volume`` downcast them), and
+    ``ram_aware_slice_cap`` only lets the count grow on machines with the memory to
+    absorb it.
     """
     return load_ct_volume(dicom_files, max_slices)
 
@@ -685,6 +687,16 @@ def show_response(response: str) -> None:
     st.markdown(response)
 
 
+def hit_token_cap(finish: dict) -> bool:
+    """True when ``run_model``'s ``finish`` out-param reports a token-cap stop.
+
+    A named helper rather than the literal at five store sites: it is the single
+    place a second surfaced finish reason would land, and it keeps a typo in the
+    comparison from silently disabling the warning on one tab only.
+    """
+    return finish.get("reason") == "length"
+
+
 def warn_if_truncated(result: dict) -> None:
     """Flag a persisted result whose generation hit the token cap.
 
@@ -694,10 +706,20 @@ def warn_if_truncated(result: dict) -> None:
     routine here rather than exotic: a plain "Describe this chest X-ray" does not fit
     the 300-token budget, and the CT/WSI reads regularly reach 2000.
 
-    Rendered above the result rather than beside the answer, because it qualifies
-    everything below it -- including the localization path, which draws boxes and a
-    label legend but never calls ``show_response``, and where a JSON list clipped
-    at the cap silently costs structures.
+    Placement is per tab rather than folded into ``show_response`` or
+    ``fresh_result_or_hint``, because the two tab shapes want opposite things:
+
+    - **CXR** warns *before* the mode branch. The localization path draws boxes and a
+      label legend and never calls ``show_response``, and that is precisely where a
+      JSON list clipped at the cap silently costs structures.
+    - **CT / WSI** warn *immediately above* ``show_response``. Their blocks open with
+      full-width imaging (a windowed slice plus the gallery; an overlay plus a sample
+      patch) that fills the viewport under ``layout="centered"``, so a warning at the
+      top is scrolled out of view by the time the reader reaches the report.
+    - **Ask** has nothing between the two, so either reading gives the same layout.
+
+    Consolidating to one call site would have to pick one of those and be wrong for
+    the other half of the tabs.
     """
     if result.get("truncated"):
         st.warning(
@@ -1014,7 +1036,7 @@ def render_ask_tab(model, processor, config):
                 # Deliberately not part of ``sig``: truncation is an outcome of the
                 # run, not an input to it, so including it would strand the very
                 # result it describes on the next rerun.
-                "truncated": finish.get("reason") == "length",
+                "truncated": hit_token_cap(finish),
                 "sig": ask_sig,
             }
             st.rerun()
@@ -1177,7 +1199,7 @@ def render_cxr_tab(model, processor, config):
                     "is_thinking": is_thinking,
                     "annotated": annotated,
                     "boxes": boxes,
-                    "truncated": finish.get("reason") == "length",
+                    "truncated": hit_token_cap(finish),
                     "sig": cxr_sig,
                 }
             else:
@@ -1185,7 +1207,7 @@ def render_cxr_tab(model, processor, config):
                     "mode": "text",
                     "raw": raw,
                     "is_thinking": is_thinking,
-                    "truncated": finish.get("reason") == "length",
+                    "truncated": hit_token_cap(finish),
                     "sig": cxr_sig,
                 }
             st.rerun()
@@ -1335,7 +1357,7 @@ def render_ct_tab(model, processor, config):
                     "count": len(slice_images),
                     "raw": raw,
                     "is_thinking": is_thinking,
-                    "truncated": finish.get("reason") == "length",
+                    "truncated": hit_token_cap(finish),
                     "sig": ct_sig,
                 }
                 # Discard the streamed run so only the clean render (preview +
@@ -1345,7 +1367,6 @@ def render_ct_tab(model, processor, config):
     result = fresh_result_or_hint("ct_result", ct_sig)
     if result is None:
         return
-    warn_if_truncated(result)
     st.image(
         result["preview"],
         caption=f"Sample windowed slice (1 of {result['count']})",
@@ -1374,6 +1395,11 @@ def render_ct_tab(model, processor, config):
         if gallery.open:
             with gallery:
                 st.image(thumbs, caption=result["labels"], width=180)
+    # Directly above the answer, not at the top of the block: a full-width windowed
+    # slice plus the gallery fill the viewport under layout="centered", so a warning
+    # up there is scrolled off by the time the reader reaches the report it qualifies.
+    # (The CXR tab warns before its mode branch instead -- see render_cxr_tab.)
+    warn_if_truncated(result)
     show_response(render_thought(result["raw"], result["is_thinking"]))
 
 
@@ -1492,7 +1518,7 @@ def render_wsi_tab(model, processor, config):
                     "preview": patches[0],
                     "raw": raw,
                     "is_thinking": is_thinking,
-                    "truncated": finish.get("reason") == "length",
+                    "truncated": hit_token_cap(finish),
                     "sig": wsi_sig,
                 }
                 # Discard the streamed run so only the clean render (overlay + sample
@@ -1502,7 +1528,6 @@ def render_wsi_tab(model, processor, config):
     result = fresh_result_or_hint("wsi_result", wsi_sig)
     if result is None:
         return
-    warn_if_truncated(result)
     st.image(result["overlay"], caption="Tissue overview", width="stretch")
     st.caption(f"{result['count']} patches sampled at ~{result['actual_mag']:.1f}x.")
     st.image(
@@ -1510,6 +1535,9 @@ def render_wsi_tab(model, processor, config):
         caption=f"Sample patch (1 of {result['count']})",
         width="stretch",
     )
+    # Above the answer, for the reason spelled out in render_ct_tab: two full-width
+    # images sit between the top of this block and the report.
+    warn_if_truncated(result)
     show_response(render_thought(result["raw"], result["is_thinking"]))
 
 
